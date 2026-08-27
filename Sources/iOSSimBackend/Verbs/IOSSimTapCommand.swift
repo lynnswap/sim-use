@@ -294,6 +294,11 @@ public struct IOSSimTapCommand: SimUseExecutableCommand {
             try await Task.sleep(nanoseconds: UInt64(preDelay * 1_000_000_000))
         }
 
+        if let eventPath = ProcessInfo.processInfo.environment["SIM_USE_TOUCH_OVERLAY_PROBE_EVENT_FILE"] {
+            let payload = "tap|\(UUID().uuidString)|\(dispatchPoint.x)|\(dispatchPoint.y)"
+            try Data(payload.utf8).write(to: URL(fileURLWithPath: eventPath), options: .atomic)
+        }
+
         if multiTouch.fingers == 2 {
             // Finger geometry is defined in UI space (offsets relative to
             // what the user sees); both fingers cross into framebuffer
