@@ -182,11 +182,23 @@ public struct IOSSimSwipeCommand: SimUseExecutableCommand {
 
         let finalEvent = events.count == 1 ? events[0] : FBSimulatorHIDEvent.composite(events)
 
+        let session = try await HIDInteractor.makeSession(for: device.resolved, logger: logger)
+
+        if let eventPath = ProcessInfo.processInfo.environment["SIM_USE_TOUCH_OVERLAY_PROBE_EVENT_FILE"] {
+            let payload = "swipe|\(UUID().uuidString)|\(dispatch.startX)|\(dispatch.startY)|\(dispatch.endX)|\(dispatch.endY)|\(swipeDuration)"
+            try Data(payload.utf8).write(to: URL(fileURLWithPath: eventPath), options: .atomic)
+        }
+
         try await HIDInteractor.performHIDEvent(
             finalEvent,
-            for: device.resolved,
+            in: session,
             logger: logger
         )
+
+        if let eventPath = ProcessInfo.processInfo.environment["SIM_USE_TOUCH_OVERLAY_PROBE_EVENT_FILE"] {
+            let payload = "swipeEnd|\(UUID().uuidString)|\(dispatch.endX)|\(dispatch.endY)"
+            try Data(payload.utf8).write(to: URL(fileURLWithPath: eventPath), options: .atomic)
+        }
 
         logger.info().log("Swipe gesture completed successfully")
         return ExecutionResult(coordinates: coords, commandAdvisory: advisory)

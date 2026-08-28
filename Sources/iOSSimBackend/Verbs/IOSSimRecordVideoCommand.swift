@@ -175,18 +175,118 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
             keyFrameRate: 2.0
         )
 
-        let recording: any FBVideoRecording
+        let framebuffer: FBFramebuffer
         do {
-            recording = try await simulator.startRecording(toFile: outputURL.path, configuration: config)
+            framebuffer = try await simulator.connectToFramebuffer()
         } catch {
             throw RecordingUnavailableError(underlying: error.localizedDescription)
         }
 
+        let recording = FBSimulatorVideo.video(
+            withFramebuffer: framebuffer,
+            configuration: config,
+            filePath: outputURL.path,
+            logger: SimUseLogger()
+        )
+
+        guard let screenInfo = simulator.screenInfo,
+              screenInfo.widthPixels > 0,
+              screenInfo.heightPixels > 0,
+              screenInfo.scale > 0
+        else {
+            throw RecordingUnavailableError(underlying: "Simulator screen info is unavailable")
+        }
+
+        let transform = FBOverlayCoordinateTransform(
+            screenPixelWidth: Int(screenInfo.widthPixels),
+            screenPixelHeight: Int(screenInfo.heightPixels),
+            retinaScale: CGFloat(screenInfo.scale),
+            videoScale: CGFloat(scale),
+            borderTop: 0,
+            scaledBorderTop: 0,
+            borderBottom: 0,
+            scaledBorderBottom: 0,
+            coordSpace: .device
+        )
+        let renderer = FBOverlayRenderer(transform: transform)
+        recording.stream.updateOverlayBuffer(renderer.buffer)
+
+        do {
+            try await recording.startRecording()
+        } catch {
+            throw RecordingUnavailableError(underlying: error.localizedDescription)
+        }
+
+        let eventPath = ProcessInfo.processInfo.environment["SIM_USE_TOUCH_OVERLAY_PROBE_EVENT_FILE"]
+        var lastEventPayload: String?
+
         while !(Task.isCancelled || cancellationFlag.isCancelled()) {
-            try? await cancellableSleep(seconds: 0.1, flag: cancellationFlag)
+            if let eventPath,
+               let payload = try? String(contentsOfFile: eventPath, encoding: .utf8),
+               payload != lastEventPayload
+            {
+                lastEventPayload = payload
+                let fields = payload.split(separator: "|", omittingEmptySubsequences: false)
+
+                if fields.count == 4,
+                   fields[0] == "tap",
+                   let x = Double(fields[2]),
+                   let y = Double(fields[3])
+                {
+                    let fade = FBOverlayShape.Effect.fadeout(.init(durationMs: 900))
+                    renderer.render(overlays: [
+                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 22, rgba: [53.55, 155.55, 234.6, 1], effect: fade)),
+                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 19, rgba: [53.55, 155.55, 234.6, 0.5], effect: fade)),
+                    ])
+                    recording.stream.updateOverlayBuffer(renderer.buffer)
+                    renderer.startEffectTimer {
+                        recording.stream.updateOverlayBuffer(renderer.buffer)
+                    }
+                } else if fields.count == 7,
+                          fields[0] == "swipe",
+                          let startX = Double(fields[2]),
+                          let startY = Double(fields[3]),
+                          let endX = Double(fields[4]),
+                          let endY = Double(fields[5]),
+                          let duration = Double(fields[6])
+                {
+                    let translate = FBOverlayShape.Effect.translate(.init(
+                        x: CGFloat(endX),
+                        y: CGFloat(endY),
+                        durationMs: CGFloat(duration * 1_000)
+                    ))
+                    renderer.render(overlays: [
+                        .circle(.init(x: CGFloat(startX), y: CGFloat(startY), radius: 22, rgba: [53.55, 155.55, 234.6, 1], effect: translate)),
+                        .circle(.init(x: CGFloat(startX), y: CGFloat(startY), radius: 19, rgba: [53.55, 155.55, 234.6, 0.5], effect: translate)),
+                    ])
+                    recording.stream.updateOverlayBuffer(renderer.buffer)
+                    renderer.startEffectTimer {
+                        recording.stream.updateOverlayBuffer(renderer.buffer)
+                    }
+                } else if fields.count == 4,
+                          fields[0] == "swipeEnd",
+                          let x = Double(fields[2]),
+                          let y = Double(fields[3])
+                {
+                    renderer.clear()
+                    let fade = FBOverlayShape.Effect.fadeout(.init(durationMs: 650))
+                    renderer.render(overlays: [
+                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 22, rgba: [53.55, 155.55, 234.6, 1], effect: fade)),
+                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 19, rgba: [53.55, 155.55, 234.6, 0.5], effect: fade)),
+                    ])
+                    recording.stream.updateOverlayBuffer(renderer.buffer)
+                    renderer.startEffectTimer {
+                        recording.stream.updateOverlayBuffer(renderer.buffer)
+                    }
+                }
+            }
+
+            try? await cancellableSleep(seconds: 1.0 / 60.0, flag: cancellationFlag)
         }
 
         do {
+            renderer.clear()
+            recording.stream.updateOverlayBuffer(renderer.buffer)
             _ = try await recording.stop()
         } catch {
             // Whether a usable file survived a mid-recording failure is not
