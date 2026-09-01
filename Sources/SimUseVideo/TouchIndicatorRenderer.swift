@@ -288,11 +288,13 @@ package final class TouchIndicatorRenderer {
     }
 
     private func begin(_ update: TouchIndicatorContactUpdate) {
-        if let previousSequence = activeSequences.removeValue(forKey: update.contactID),
-           var previous = timelines[previousSequence]
-        {
-            previous.endedAtNanoseconds = update.uptimeNanoseconds
-            timelines[previousSequence] = previous
+        if activeSequences[update.contactID] != nil {
+            // A publisher process may restart between split touch commands and
+            // lose its phase state. The recording session still owns the live
+            // contact ID, so another began for that active ID is movement, not
+            // a second contact generation.
+            move(update)
+            return
         }
 
         let sequence = nextContactSequence

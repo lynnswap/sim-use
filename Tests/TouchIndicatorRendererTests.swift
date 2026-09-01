@@ -330,6 +330,24 @@ struct TouchIndicatorRendererTests {
         #expect(pixels.pixel(x: 120, y: 64).alpha > 0)
     }
 
+    @Test("Repeated began for an active ID moves the existing contact without leaving a trail")
+    func repeatedActiveBeginMovesExistingContact() throws {
+        let clock = FakeClock()
+        let renderer = try makeRenderer(width: 180, clock: clock)
+        renderer.apply([update(.began, id: 0, x: 30, y: 64, at: 0)])
+        #expect(try snapshot(renderer.render()).pixel(x: 30, y: 64).alpha > 0)
+
+        clock.advance(milliseconds: 100)
+        renderer.apply([
+            update(.began, id: 0, x: 145, y: 64, at: 100_000_000),
+        ])
+        let pixels = try snapshot(renderer.render())
+
+        #expect(pixels.pixel(x: 30, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 145, y: 64).alpha > 0)
+        #expect(!renderer.needsAnimationFrame)
+    }
+
     @Test("Unknown moved and terminal updates do not invent a visible contact")
     func unknownUpdatesAreNoOp() throws {
         let clock = FakeClock()
