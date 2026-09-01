@@ -82,7 +82,7 @@ Every byte of command output you read costs context. Defaults that keep the loop
 | Swipe | `sim-use swipe --from 50,500 --to 350,500 --device <UDID>` |
 | Pinch zoom in | `sim-use gesture pinch-out --device <UDID>` (two-finger spread) |
 | Rotate | `sim-use gesture rotate-cw --angle 90 --device <UDID>` |
-| Record evidence GIF | `sim-use record-video --output demo.gif --device <UDID>` — stop with SIGINT/SIGTERM (never SIGKILL); transcodes after stop; auto-plays inline in PRs; add `--gif-markers` for START/END loop-boundary cards |
+| Record evidence GIF | `sim-use record-video --output demo.gif --device <UDID>` — stop with SIGINT/SIGTERM (never SIGKILL); transcodes after stop; auto-plays inline in PRs; add `--gif-markers` for START/END loop-boundary cards; on iOS Simulator, add `--touch-indicators` (optionally `--touch-color orange`) to show sim-use-issued touches |
 
 ### Physical iOS devices (experimental)
 

@@ -324,6 +324,10 @@ sim-use record-video --device $UDID --output recording.mp4            # 30 fps d
 sim-use record-video --device $UDID --fps 60 --output smooth.mp4      # up to 60 fps
 sim-use record-video --device $UDID --quality 60 --scale 0.5 --output low-bw.mp4
 
+# Show sim-use-issued touches in an iOS Simulator recording (opt-in)
+sim-use record-video --device $UDID --touch-indicators --output demo.mp4
+sim-use record-video --device $UDID --touch-indicators --touch-color orange --output demo.mp4
+
 # Record an animated GIF (cross-platform) — auto-plays inline in PRs / issues / chat
 sim-use record-video --device $UDID --output demo.gif                 # format inferred from extension
 sim-use record-video --device $UDID --format gif                      # sim-use-video-<timestamp>.gif
@@ -338,6 +342,17 @@ native variable frame rate (`--fps` ignored, `--quality` → bitrate,
 limit on API < 34 automatically. Rotating the display mid-recording stops
 capture on Android (an MP4 track can't change frame size). Press Ctrl+C to
 stop; sim-use finalises the MP4 before exiting.
+
+iOS Simulator recordings can opt into `--touch-indicators` to show the
+touches issued through sim-use (including swipes and multi-touch gestures).
+The indicator uses a 44-point ring with a semantic system color: `blue` by
+default, or one of `red`, `orange`, `yellow`, `green`, `mint`, `teal`, `cyan`,
+`indigo`, `purple`, `pink`, `brown`, or `gray` via `--touch-color`. The color
+option requires `--touch-indicators`; arbitrary RGB/hex colors are not
+accepted. Indicators represent input scheduled by sim-use, not proof that the
+foreground app handled it. Android recordings reject this opt-in until their
+capture path can guarantee the same behavior; without the flag, both platforms
+retain the faithful-capture default.
 
 `--format gif` (or a `.gif` `--output` extension) records the same H.264
 stream to an intermediate MP4, then transcodes it into a looping GIF once
