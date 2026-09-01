@@ -5,7 +5,8 @@ import Foundation
 
 /// Canonical per-UDID endpoint for the recording touch-indicator channel.
 /// The channel deliberately shares the daemon's validated 0700 base directory,
-/// but uses its own socket and ownership file rather than the command FIFO.
+/// but keeps its socket and ownership file in a separate `touch/` namespace so
+/// daemon discovery cannot interpret the recorder's PID as a command daemon.
 package struct RecordedTouchTransportPaths: Sendable {
     package let udid: String
     package let baseDirectory: URL
@@ -15,16 +16,26 @@ package struct RecordedTouchTransportPaths: Sendable {
         self.baseDirectory = baseDirectory ?? DaemonPaths.defaultBaseDirectory
     }
 
+    package var channelDirectory: URL {
+        baseDirectory.appendingPathComponent("touch", isDirectory: true)
+    }
+
     package var socketURL: URL {
-        baseDirectory.appendingPathComponent("\(udid).touch.sock", isDirectory: false)
+        channelDirectory.appendingPathComponent("\(udid).sock", isDirectory: false)
     }
 
     package var pidfileURL: URL {
-        baseDirectory.appendingPathComponent("\(udid).touch.pid", isDirectory: false)
+        channelDirectory.appendingPathComponent("\(udid).pid", isDirectory: false)
     }
 
     package func ensureSecureBaseDirectory() throws {
         try DaemonPaths(udid: udid, baseDirectory: baseDirectory).ensureBaseDirectory()
+        try FileManager.default.createDirectory(
+            at: channelDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)]
+        )
+        try DaemonPaths.validateBaseDirectory(at: channelDirectory)
     }
 }
 
@@ -385,6 +396,22 @@ package struct RecordedTouchEventPublisher: Sendable {
             return .failed(.init(
                 kind: .endpointInspectionFailed,
                 message: "Cannot trust \(paths.baseDirectory.path): \(String(describing: error))"
+            ))
+        }
+
+        guard lstat(paths.channelDirectory.path, &endpointStat) == 0 else {
+            if errno == ENOENT { return .noListener }
+            return .failed(Self.syscallDiagnostic(
+                kind: .endpointInspectionFailed,
+                operation: "lstat touch channel directory"
+            ))
+        }
+        do {
+            try DaemonPaths.validateBaseDirectory(at: paths.channelDirectory)
+        } catch {
+            return .failed(.init(
+                kind: .endpointInspectionFailed,
+                message: "Cannot trust \(paths.channelDirectory.path): \(String(describing: error))"
             ))
         }
 

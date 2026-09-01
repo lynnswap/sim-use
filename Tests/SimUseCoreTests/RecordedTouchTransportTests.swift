@@ -27,6 +27,7 @@ final class RecordedTouchTransportTests: XCTestCase {
         defer { listener.close() }
 
         XCTAssertEqual(mode(of: base) & 0o777, 0o700)
+        XCTAssertEqual(mode(of: listener.paths.channelDirectory) & 0o777, 0o700)
         XCTAssertEqual(mode(of: listener.paths.socketURL) & 0o777, 0o600)
         XCTAssertEqual(mode(of: listener.paths.pidfileURL) & 0o777, 0o600)
 
@@ -36,6 +37,19 @@ final class RecordedTouchTransportTests: XCTestCase {
         ).publish(event)
         XCTAssertEqual(result, .delivered)
         wait(for: [received], timeout: 2)
+    }
+
+    func testListenerOwnershipIsOutsideDaemonDiscoveryNamespace() throws {
+        let base = makeBaseDirectoryURL()
+        defer { removeTemporaryDirectory(base) }
+        let listener = try RecordedTouchEventListener(
+            udid: "SIM-NOT-A-DAEMON",
+            baseDirectory: base,
+            onEvent: { _ in }
+        )
+        defer { listener.close() }
+
+        XCTAssertTrue(try DaemonPaths.enumerateLiveDaemons(baseDirectory: base).isEmpty)
     }
 
     func testLargeGestureTimelineIsChunkedWithoutDroppingSamples() throws {
@@ -304,9 +318,9 @@ final class RecordedTouchTransportTests: XCTestCase {
     func testExistingEndpointDeliveryFailureIsObservable() throws {
         let base = makeBaseDirectoryURL()
         defer { removeTemporaryDirectory(base) }
-        try createSecureDirectory(base)
         let event = makeEvent(udid: "SIM-BROKEN")
         let paths = RecordedTouchTransportPaths(udid: event.udid, baseDirectory: base)
+        try paths.ensureSecureBaseDirectory()
         XCTAssertTrue(FileManager.default.createFile(atPath: paths.socketURL.path, contents: Data()))
 
         let result = RecordedTouchEventPublisher(
@@ -348,9 +362,9 @@ final class RecordedTouchTransportTests: XCTestCase {
     func testDeadOwnerIsReclaimedBeforeBinding() throws {
         let base = makeBaseDirectoryURL()
         defer { removeTemporaryDirectory(base) }
-        try createSecureDirectory(base)
         let udid = "SIM-STALE"
         let paths = RecordedTouchTransportPaths(udid: udid, baseDirectory: base)
+        try paths.ensureSecureBaseDirectory()
         try Data("\(deadPID)\n".utf8).write(to: paths.pidfileURL)
         XCTAssertTrue(FileManager.default.createFile(
             atPath: paths.socketURL.path,
@@ -382,9 +396,9 @@ final class RecordedTouchTransportTests: XCTestCase {
     func testLivePIDWithoutAnAcquiredSocketIsNotReclaimed() throws {
         let base = makeBaseDirectoryURL()
         defer { removeTemporaryDirectory(base) }
-        try createSecureDirectory(base)
         let udid = "SIM-LIVE-OWNER"
         let paths = RecordedTouchTransportPaths(udid: udid, baseDirectory: base)
+        try paths.ensureSecureBaseDirectory()
         try Data("\(getpid())\n".utf8).write(to: paths.pidfileURL)
 
         XCTAssertThrowsError(
@@ -402,9 +416,9 @@ final class RecordedTouchTransportTests: XCTestCase {
     func testUnverifiableOwnerIsNotReclaimed() throws {
         let base = makeBaseDirectoryURL()
         defer { removeTemporaryDirectory(base) }
-        try createSecureDirectory(base)
         let udid = "SIM-UNKNOWN-OWNER"
         let paths = RecordedTouchTransportPaths(udid: udid, baseDirectory: base)
+        try paths.ensureSecureBaseDirectory()
         try Data("not-a-pid\n".utf8).write(to: paths.pidfileURL)
         XCTAssertTrue(FileManager.default.createFile(
             atPath: paths.socketURL.path,
@@ -424,9 +438,9 @@ final class RecordedTouchTransportTests: XCTestCase {
     func testOwnerlessEndpointFailsWithoutLeavingAClaimFile() throws {
         let base = makeBaseDirectoryURL()
         defer { removeTemporaryDirectory(base) }
-        try createSecureDirectory(base)
         let udid = "SIM-OWNERLESS"
         let paths = RecordedTouchTransportPaths(udid: udid, baseDirectory: base)
+        try paths.ensureSecureBaseDirectory()
         let endpointData = Data("ownerless".utf8)
         try endpointData.write(to: paths.socketURL)
 
@@ -642,14 +656,6 @@ final class RecordedTouchTransportTests: XCTestCase {
         URL(
             fileURLWithPath: "/tmp/sim-use-touch-tests-\(UUID().uuidString.prefix(8))",
             isDirectory: true
-        )
-    }
-
-    private func createSecureDirectory(_ url: URL) throws {
-        try FileManager.default.createDirectory(
-            at: url,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: NSNumber(value: 0o700)]
         )
     }
 
