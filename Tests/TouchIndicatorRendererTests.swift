@@ -348,6 +348,28 @@ struct TouchIndicatorRendererTests {
         #expect(!renderer.needsAnimationFrame)
     }
 
+    @Test("A delayed terminal update cannot close a newer lifecycle for a reused contact ID")
+    func delayedTerminalDoesNotCloseNewerLifecycle() throws {
+        let clock = FakeClock()
+        let renderer = try makeRenderer(width: 180, clock: clock)
+        renderer.apply([
+            update(.began, id: 0, x: 30, y: 64, at: 10),
+            update(.began, id: 1, x: 90, y: 64, at: 10),
+        ])
+        _ = try renderer.render()
+
+        clock.advance(milliseconds: 1)
+        renderer.apply([update(.began, id: 0, x: 145, y: 64, at: 150)])
+        _ = try renderer.render()
+        renderer.apply([update(.ended, id: 0, x: 30, y: 64, at: 100)])
+
+        let pixels = try snapshot(renderer.render())
+        #expect(pixels.pixel(x: 30, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 90, y: 64).alpha > 0)
+        #expect(pixels.pixel(x: 145, y: 64).alpha > 0)
+        #expect(!renderer.needsAnimationFrame)
+    }
+
     @Test("Unknown moved and terminal updates do not invent a visible contact")
     func unknownUpdatesAreNoOp() throws {
         let clock = FakeClock()

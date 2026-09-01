@@ -52,6 +52,67 @@ final class RecordedTouchTransportTests: XCTestCase {
         XCTAssertTrue(try DaemonPaths.enumerateLiveDaemons(baseDirectory: base).isEmpty)
     }
 
+    func testFailedTerminalDatagramIsRecoveredAfterDeliveredDown() throws {
+        let base = makeBaseDirectoryURL()
+        defer { removeTemporaryDirectory(base) }
+        let udid = "SIM-TERMINAL-RECOVERY"
+        let down = makeSingleContactEvent(
+            udid: udid,
+            phase: .began,
+            dispatchUptimeNanoseconds: 100
+        )
+        let up = makeSingleContactEvent(
+            udid: udid,
+            phase: .ended,
+            dispatchUptimeNanoseconds: 200
+        )
+        let received = expectation(description: "down and recovered up delivered")
+        received.expectedFulfillmentCount = 2
+        let receivedEvents = LockedBox<[RecordedTouchEvent]>([])
+
+        let listener = try RecordedTouchEventListener(
+            udid: udid,
+            baseDirectory: base,
+            onEvent: { event in
+                receivedEvents.withValue { $0.append(event) }
+                received.fulfill()
+            },
+            onDiagnostic: { diagnostic in
+                XCTFail("Unexpected diagnostic: \(diagnostic)")
+            }
+        )
+        defer { listener.close() }
+
+        XCTAssertEqual(
+            RecordedTouchEventPublisher(udid: udid, baseDirectory: base)
+                .publish(down),
+            .delivered
+        )
+
+        let sendCount = LockedBox(0)
+        let failingSender = RecordedTouchDatagramSender { _, _, _ in
+            sendCount.withValue { $0 += 1 }
+            return .failed(errorNumber: EAGAIN)
+        }
+        let terminalResult = RecordedTouchEventPublisher(
+            udid: udid,
+            baseDirectory: base,
+            datagramSender: failingSender
+        ).publish(up)
+        guard case .failed(let diagnostic) = terminalResult else {
+            return XCTFail("Expected injected terminal delivery failure")
+        }
+        XCTAssertEqual(diagnostic.kind, .deliveryFailed)
+        XCTAssertTrue(diagnostic.message.contains("terminal recovery queued"))
+
+        wait(for: [received], timeout: 2)
+        XCTAssertEqual(sendCount.value, 1)
+        XCTAssertEqual(
+            receivedEvents.value.flatMap(\.samples).flatMap(\.contacts).map(\.phase),
+            [.began, .ended]
+        )
+    }
+
     func testLargeGestureTimelineIsChunkedWithoutDroppingSamples() throws {
         let base = makeBaseDirectoryURL()
         defer { removeTemporaryDirectory(base) }
@@ -225,7 +286,42 @@ final class RecordedTouchTransportTests: XCTestCase {
         ).event)
     }
 
-    func testIncompleteReassemblyExpiresAndCannotBeResurrected() {
+    func testTerminalRecoverySupersedesPartialChunksForTheSameEvent() {
+        let udid = "SIM-PARTIAL-RECOVERY"
+        let event = makeEvent(udid: udid)
+        let first = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[0]]),
+            chunkIndex: 0,
+            chunkCount: 2
+        )
+        let second = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[1]]),
+            chunkIndex: 1,
+            chunkCount: 2
+        )
+        let recovery = copy(event, samples: [event.samples[1]])
+        var reassembler = RecordedTouchEventReassembler()
+
+        XCTAssertNil(reassembler.accept(
+            first,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: 10
+        ).event)
+        XCTAssertEqual(reassembler.acceptRecoveryEvent(
+            recovery,
+            expectedUDID: udid,
+            nowNanoseconds: 11
+        ).event, recovery)
+        XCTAssertNil(reassembler.accept(
+            second,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: 12
+        ).event)
+    }
+
+    func testRecoverySupersedesExpiredPartialAndTombstonesLateChunks() {
         let udid = "SIM-EXPIRED"
         let event = makeEvent(udid: udid)
         let first = RecordedTouchEventDatagram(
@@ -238,6 +334,7 @@ final class RecordedTouchTransportTests: XCTestCase {
             chunkIndex: 1,
             chunkCount: 2
         )
+        let recovery = copy(event, samples: [event.samples[1]])
         var reassembler = RecordedTouchEventReassembler()
 
         _ = reassembler.accept(first, encodedBytes: 100, expectedUDID: udid, nowNanoseconds: 0)
@@ -245,11 +342,58 @@ final class RecordedTouchTransportTests: XCTestCase {
             nowNanoseconds: RecordedTouchEventReassembler.assemblyTimeoutNanoseconds
         )
         XCTAssertEqual(diagnostics.map(\.kind), [.incompleteEventDiscarded])
+        let recoveryUptime = RecordedTouchEventReassembler.assemblyTimeoutNanoseconds + 1
+        XCTAssertEqual(reassembler.acceptRecoveryEvent(
+            recovery,
+            expectedUDID: udid,
+            nowNanoseconds: recoveryUptime
+        ).event, recovery)
         XCTAssertNil(reassembler.accept(
             second,
             encodedBytes: 100,
             expectedUDID: udid,
-            nowNanoseconds: RecordedTouchEventReassembler.assemblyTimeoutNanoseconds + 1
+            nowNanoseconds: recoveryUptime + 1
+        ).event)
+        XCTAssertNil(reassembler.acceptRecoveryEvent(
+            recovery,
+            expectedUDID: udid,
+            nowNanoseconds: recoveryUptime + 2
+        ).event)
+    }
+
+    func testRecoveryRefreshesDeduplicationAfterDiscardDeadline() {
+        let udid = "SIM-RECOVERY-DEADLINE"
+        let event = makeEvent(udid: udid)
+        let invalid = RecordedTouchEventDatagram(
+            event: event,
+            chunkIndex: 0,
+            chunkCount: RecordedTouchEventReassembler.maximumChunkCount + 1
+        )
+        let replay = RecordedTouchEventDatagram(
+            event: event,
+            chunkIndex: 0,
+            chunkCount: 1
+        )
+        let recovery = copy(event, samples: [event.samples[1]])
+        var reassembler = RecordedTouchEventReassembler()
+        let recoveryUptime = RecordedTouchEventReassembler.tombstoneLifetimeNanoseconds - 1
+
+        XCTAssertNil(reassembler.accept(
+            invalid,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: 0
+        ).event)
+        XCTAssertEqual(reassembler.acceptRecoveryEvent(
+            recovery,
+            expectedUDID: udid,
+            nowNanoseconds: recoveryUptime
+        ).event, recovery)
+        XCTAssertNil(reassembler.accept(
+            replay,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: RecordedTouchEventReassembler.tombstoneLifetimeNanoseconds + 1
         ).event)
     }
 
@@ -365,7 +509,22 @@ final class RecordedTouchTransportTests: XCTestCase {
         let udid = "SIM-STALE"
         let paths = RecordedTouchTransportPaths(udid: udid, baseDirectory: base)
         try paths.ensureSecureBaseDirectory()
-        try Data("\(deadPID)\n".utf8).write(to: paths.pidfileURL)
+        let staleGeneration = RecordedTouchListenerGeneration(
+            token: UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!
+        )
+        try Data(
+            "\(deadPID)\n\(staleGeneration.token.uuidString)\n".utf8
+        ).write(to: paths.pidfileURL)
+        let staleRecoveryURL = paths.recoveryURL(for: staleGeneration)
+        XCTAssertTrue(try RecordedTouchRecoveryJournal.appendTerminalEvent(
+            makeSingleContactEvent(
+                udid: udid,
+                phase: .ended,
+                dispatchUptimeNanoseconds: 1
+            ),
+            generation: staleGeneration,
+            at: staleRecoveryURL
+        ))
         XCTAssertTrue(FileManager.default.createFile(
             atPath: paths.socketURL.path,
             contents: Data("stale".utf8)
@@ -386,11 +545,63 @@ final class RecordedTouchTransportTests: XCTestCase {
 
         XCTAssertNotEqual(inode(of: paths.socketURL), staleSocketInode)
         XCTAssertEqual(readPID(paths.pidfileURL), getpid())
+        XCTAssertNotEqual(listener.generation, staleGeneration)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleRecoveryURL.path))
         XCTAssertEqual(
             RecordedTouchEventPublisher(udid: udid, baseDirectory: base).publish(event),
             .delivered
         )
         wait(for: [delivered], timeout: 2)
+    }
+
+    func testTerminalRecoveryIsNotQueuedAfterListenerGenerationChanges() throws {
+        let base = makeBaseDirectoryURL()
+        defer { removeTemporaryDirectory(base) }
+        let udid = "SIM-RECOVERY-RESTART"
+        let listeners = LockedBox<[RecordedTouchEventListener]>([
+            try RecordedTouchEventListener(
+                udid: udid,
+                baseDirectory: base,
+                onEvent: { _ in }
+            ),
+        ])
+        defer {
+            for listener in listeners.value {
+                listener.close()
+            }
+        }
+        let oldGeneration = listeners.value[0].generation
+        let paths = listeners.value[0].paths
+        let sender = RecordedTouchDatagramSender { _, _, _ in
+            listeners.value[0].close()
+            let replacement = try! RecordedTouchEventListener(
+                udid: udid,
+                baseDirectory: base,
+                onEvent: { _ in }
+            )
+            listeners.withValue { $0.append(replacement) }
+            return .failed(errorNumber: EAGAIN)
+        }
+
+        let result = RecordedTouchEventPublisher(
+            udid: udid,
+            baseDirectory: base,
+            datagramSender: sender
+        ).publish(makeSingleContactEvent(
+            udid: udid,
+            phase: .ended,
+            dispatchUptimeNanoseconds: 10
+        ))
+
+        guard case .failed(let diagnostic) = result else {
+            return XCTFail("Expected injected delivery failure")
+        }
+        XCTAssertEqual(diagnostic.kind, .deliveryFailed)
+        XCTAssertFalse(diagnostic.message.contains("recovery queued"))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: paths.recoveryURL(for: oldGeneration).path
+        ))
+        XCTAssertNotEqual(listeners.value.last?.generation, oldGeneration)
     }
 
     func testLivePIDWithoutAnAcquiredSocketIsNotReclaimed() throws {
@@ -639,6 +850,26 @@ final class RecordedTouchTransportTests: XCTestCase {
         )
     }
 
+    private func makeSingleContactEvent(
+        udid: String,
+        phase: RecordedTouchPhase,
+        dispatchUptimeNanoseconds: UInt64
+    ) -> RecordedTouchEvent {
+        RecordedTouchEvent(
+            udid: udid,
+            dispatchUptimeNanoseconds: dispatchUptimeNanoseconds,
+            samples: [RecordedTouchSample(
+                relativeNanoseconds: 0,
+                contacts: [RecordedTouchContact(
+                    contactID: 0,
+                    phase: phase,
+                    x: 100,
+                    y: 200
+                )]
+            )]
+        )
+    }
+
     private func copy(
         _ event: RecordedTouchEvent,
         samples: [RecordedTouchSample]
@@ -680,7 +911,10 @@ final class RecordedTouchTransportTests: XCTestCase {
               let text = String(data: data, encoding: .utf8) else {
             return nil
         }
-        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let firstLine = text.split(whereSeparator: \.isNewline).first else {
+            return nil
+        }
+        return pid_t(firstLine)
     }
 
     private func sendRawDatagram(_ data: Data, to path: String) throws {

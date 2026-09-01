@@ -88,6 +88,7 @@ package final class TouchIndicatorRenderer {
 
     private struct ContactTimeline {
         let sequence: UInt64
+        var generationStartedAtNanoseconds: UInt64
         var position: CGPoint
         var endedAtNanoseconds: UInt64?
     }
@@ -288,12 +289,18 @@ package final class TouchIndicatorRenderer {
     }
 
     private func begin(_ update: TouchIndicatorContactUpdate) {
-        if activeSequences[update.contactID] != nil {
+        if let sequence = activeSequences[update.contactID],
+           var timeline = timelines[sequence] {
             // A publisher process may restart between split touch commands and
             // lose its phase state. The recording session still owns the live
             // contact ID, so another began for that active ID is movement, not
-            // a second contact generation.
-            move(update)
+            // a second visible timeline. It does start a newer lifecycle epoch:
+            // a delayed terminal update from before this began must not close it.
+            guard update.uptimeNanoseconds >= timeline.generationStartedAtNanoseconds
+            else { return }
+            timeline.generationStartedAtNanoseconds = update.uptimeNanoseconds
+            timeline.position = update.position
+            timelines[sequence] = timeline
             return
         }
 
@@ -302,6 +309,7 @@ package final class TouchIndicatorRenderer {
         activeSequences[update.contactID] = sequence
         timelines[sequence] = ContactTimeline(
             sequence: sequence,
+            generationStartedAtNanoseconds: update.uptimeNanoseconds,
             position: update.position,
             endedAtNanoseconds: nil
         )
@@ -309,16 +317,19 @@ package final class TouchIndicatorRenderer {
 
     private func move(_ update: TouchIndicatorContactUpdate) {
         guard let sequence = activeSequences[update.contactID],
-              var timeline = timelines[sequence]
+              var timeline = timelines[sequence],
+              update.uptimeNanoseconds >= timeline.generationStartedAtNanoseconds
         else { return }
         timeline.position = update.position
         timelines[sequence] = timeline
     }
 
     private func end(_ update: TouchIndicatorContactUpdate) {
-        guard let sequence = activeSequences.removeValue(forKey: update.contactID),
-              var timeline = timelines[sequence]
+        guard let sequence = activeSequences[update.contactID],
+              var timeline = timelines[sequence],
+              update.uptimeNanoseconds >= timeline.generationStartedAtNanoseconds
         else { return }
+        activeSequences.removeValue(forKey: update.contactID)
         timeline.position = update.position
         timeline.endedAtNanoseconds = update.uptimeNanoseconds
         timelines[sequence] = timeline

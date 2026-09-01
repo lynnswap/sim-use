@@ -28,6 +28,15 @@ package struct RecordedTouchTransportPaths: Sendable {
         channelDirectory.appendingPathComponent("\(udid).pid", isDirectory: false)
     }
 
+    package func recoveryURL(
+        for generation: RecordedTouchListenerGeneration
+    ) -> URL {
+        channelDirectory.appendingPathComponent(
+            "\(udid).\(generation.fileComponent).recovery",
+            isDirectory: false
+        )
+    }
+
     package func ensureSecureBaseDirectory() throws {
         try DaemonPaths(udid: udid, baseDirectory: baseDirectory).ensureBaseDirectory()
         try FileManager.default.createDirectory(
@@ -54,6 +63,7 @@ package struct RecordedTouchTransportDiagnostic: Equatable, Sendable, CustomStri
         case invalidChunkMetadata = "invalid_chunk_metadata"
         case incompleteEventDiscarded = "incomplete_event_discarded"
         case reassemblyLimitExceeded = "reassembly_limit_exceeded"
+        case recoveryFailed = "recovery_failed"
     }
 
     package let kind: Kind
@@ -73,6 +83,52 @@ package enum RecordedTouchPublishResult: Equatable, Sendable {
     case delivered
     case noListener
     case failed(RecordedTouchTransportDiagnostic)
+}
+
+package enum RecordedTouchDatagramSendResult: Equatable, Sendable {
+    case sent(Int)
+    case failed(errorNumber: Int32)
+}
+
+package struct RecordedTouchDatagramSender: Sendable {
+    private let operation: @Sendable (Int32, Data, String) -> RecordedTouchDatagramSendResult
+
+    package init(
+        operation: @escaping @Sendable (Int32, Data, String) -> RecordedTouchDatagramSendResult
+    ) {
+        self.operation = operation
+    }
+
+    package func send(
+        fileDescriptor: Int32,
+        payload: Data,
+        socketPath: String
+    ) -> RecordedTouchDatagramSendResult {
+        operation(fileDescriptor, payload, socketPath)
+    }
+
+    package static let system = RecordedTouchDatagramSender { fd, payload, path in
+        var address = RecordedTouchUnixDatagram.address(for: path)
+        let sent = payload.withUnsafeBytes { bytes -> Int in
+            guard let baseAddress = bytes.baseAddress else { return 0 }
+            return withUnsafePointer(to: &address) { addressPointer in
+                addressPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                    Darwin.sendto(
+                        fd,
+                        baseAddress,
+                        bytes.count,
+                        0,
+                        socketAddress,
+                        socklen_t(MemoryLayout<sockaddr_un>.size)
+                    )
+                }
+            }
+        }
+        if sent < 0 {
+            return .failed(errorNumber: errno)
+        }
+        return .sent(sent)
+    }
 }
 
 /// Versioned wire envelope for one fragment of a logical touch event.
@@ -149,9 +205,24 @@ package struct RecordedTouchEventReassembler: Sendable {
         var bufferedBytes: Int
     }
 
+    private enum TerminalEventDisposition: Equatable, Sendable {
+        case discarded
+        case delivered
+    }
+
+    private struct TerminalEventTombstone: Sendable {
+        let deadlineNanoseconds: UInt64
+        let disposition: TerminalEventDisposition
+    }
+
+    private struct TerminalEventOrderEntry: Sendable {
+        let eventID: UUID
+        let deadlineNanoseconds: UInt64
+    }
+
     private var assemblies: [UUID: Assembly] = [:]
-    private var terminalEventDeadlines: [UUID: UInt64] = [:]
-    private var terminalEventOrder: [UUID] = []
+    private var terminalEvents: [UUID: TerminalEventTombstone] = [:]
+    private var terminalEventOrder: [TerminalEventOrderEntry] = []
     private var terminalEventOrderHead = 0
     private var totalBufferedBytes = 0
 
@@ -177,7 +248,11 @@ package struct RecordedTouchEventReassembler: Sendable {
               datagram.chunkIndex >= 0,
               datagram.chunkIndex < datagram.chunkCount,
               datagram.chunkCount == 1 || !datagram.event.samples.isEmpty else {
-            tombstone(datagram.event.eventID, nowNanoseconds: nowNanoseconds)
+            tombstone(
+                datagram.event.eventID,
+                disposition: .discarded,
+                nowNanoseconds: nowNanoseconds
+            )
             diagnostics.append(.init(
                 kind: .invalidChunkMetadata,
                 message: "Invalid chunk \(datagram.chunkIndex) of \(datagram.chunkCount) for event \(datagram.event.eventID)."
@@ -188,20 +263,28 @@ package struct RecordedTouchEventReassembler: Sendable {
             datagram.event,
             expectedUDID: expectedUDID
         ) {
-            tombstone(datagram.event.eventID, nowNanoseconds: nowNanoseconds)
+            tombstone(
+                datagram.event.eventID,
+                disposition: .discarded,
+                nowNanoseconds: nowNanoseconds
+            )
             diagnostics.append(diagnostic)
             return .init(diagnostics: diagnostics)
         }
 
         let eventID = datagram.event.eventID
-        guard terminalEventDeadlines[eventID] == nil else {
+        guard terminalEvents[eventID] == nil else {
             return .init(diagnostics: diagnostics)
         }
 
         if var assembly = assemblies[eventID] {
             guard assembly.header == Header(datagram) else {
                 discardAssembly(eventID)
-                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                tombstone(
+                    eventID,
+                    disposition: .discarded,
+                    nowNanoseconds: nowNanoseconds
+                )
                 diagnostics.append(.init(
                     kind: .invalidChunkMetadata,
                     message: "Chunk metadata changed while reassembling event \(eventID)."
@@ -214,7 +297,11 @@ package struct RecordedTouchEventReassembler: Sendable {
                     return .init(diagnostics: diagnostics)
                 }
                 discardAssembly(eventID)
-                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                tombstone(
+                    eventID,
+                    disposition: .discarded,
+                    nowNanoseconds: nowNanoseconds
+                )
                 diagnostics.append(.init(
                     kind: .invalidChunkMetadata,
                     message: "Chunk \(datagram.chunkIndex) changed while reassembling event \(eventID)."
@@ -224,7 +311,11 @@ package struct RecordedTouchEventReassembler: Sendable {
 
             guard totalBufferedBytes <= Self.maximumBufferedBytes - encodedBytes else {
                 discardAssembly(eventID)
-                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                tombstone(
+                    eventID,
+                    disposition: .discarded,
+                    nowNanoseconds: nowNanoseconds
+                )
                 diagnostics.append(Self.limitDiagnostic(eventID: eventID))
                 return .init(diagnostics: diagnostics)
             }
@@ -234,13 +325,21 @@ package struct RecordedTouchEventReassembler: Sendable {
             totalBufferedBytes += encodedBytes
         } else {
             guard datagram.chunkCount > 1 else {
-                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                tombstone(
+                    eventID,
+                    disposition: .delivered,
+                    nowNanoseconds: nowNanoseconds
+                )
                 return .init(event: datagram.event, diagnostics: diagnostics)
             }
             guard assemblies.count < Self.maximumInFlightEventCount,
                   encodedBytes <= Self.maximumBufferedBytes,
                   totalBufferedBytes <= Self.maximumBufferedBytes - encodedBytes else {
-                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                tombstone(
+                    eventID,
+                    disposition: .discarded,
+                    nowNanoseconds: nowNanoseconds
+                )
                 diagnostics.append(Self.limitDiagnostic(eventID: eventID))
                 return .init(diagnostics: diagnostics)
             }
@@ -268,11 +367,20 @@ package struct RecordedTouchEventReassembler: Sendable {
         }
         let event = complete.template.withSamples(samples)
         discardAssembly(eventID)
-        tombstone(eventID, nowNanoseconds: nowNanoseconds)
         if let diagnostic = RecordedTouchEventValidator.validate(event, expectedUDID: expectedUDID) {
+            tombstone(
+                eventID,
+                disposition: .discarded,
+                nowNanoseconds: nowNanoseconds
+            )
             diagnostics.append(diagnostic)
             return .init(diagnostics: diagnostics)
         }
+        tombstone(
+            eventID,
+            disposition: .delivered,
+            nowNanoseconds: nowNanoseconds
+        )
         return .init(event: event, diagnostics: diagnostics)
     }
 
@@ -289,7 +397,11 @@ package struct RecordedTouchEventReassembler: Sendable {
         var diagnostics: [RecordedTouchTransportDiagnostic] = []
         for eventID in expiredIDs {
             discardAssembly(eventID)
-            tombstone(eventID, nowNanoseconds: nowNanoseconds)
+            tombstone(
+                eventID,
+                disposition: .discarded,
+                nowNanoseconds: nowNanoseconds
+            )
             diagnostics.append(.init(
                 kind: .incompleteEventDiscarded,
                 message: "Incomplete recorded-touch event \(eventID) expired before every chunk arrived."
@@ -298,16 +410,54 @@ package struct RecordedTouchEventReassembler: Sendable {
         return diagnostics
     }
 
+    package mutating func acceptRecoveryEvent(
+        _ event: RecordedTouchEvent,
+        expectedUDID: String,
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> RecordedTouchReassemblyOutput {
+        var diagnostics = expire(nowNanoseconds: nowNanoseconds)
+        if let diagnostic = RecordedTouchEventValidator.validate(
+            event,
+            expectedUDID: expectedUDID
+        ) {
+            diagnostics.append(diagnostic)
+            return .init(diagnostics: diagnostics)
+        }
+        guard !event.samples.isEmpty,
+              event.samples.allSatisfy({ sample in
+                  !sample.contacts.isEmpty && sample.contacts.allSatisfy {
+                      $0.phase == .ended || $0.phase == .cancelled
+                  }
+              }) else {
+            diagnostics.append(.init(
+                kind: .recoveryFailed,
+                message: "Recovery event \(event.eventID) contains a non-terminal contact."
+            ))
+            return .init(diagnostics: diagnostics)
+        }
+        if terminalEvents[event.eventID]?.disposition == .delivered {
+            return .init(diagnostics: diagnostics)
+        }
+
+        discardAssembly(event.eventID)
+        tombstone(
+            event.eventID,
+            disposition: .delivered,
+            nowNanoseconds: nowNanoseconds
+        )
+        return .init(event: event, diagnostics: diagnostics)
+    }
+
     package mutating func reset() {
         assemblies.removeAll()
-        terminalEventDeadlines.removeAll()
+        terminalEvents.removeAll()
         terminalEventOrder.removeAll()
         terminalEventOrderHead = 0
         totalBufferedBytes = 0
     }
 
     package var retainedTerminalEventCount: Int {
-        terminalEventDeadlines.count
+        terminalEvents.count
     }
 
     private mutating func discardAssembly(_ eventID: UUID) {
@@ -315,27 +465,50 @@ package struct RecordedTouchEventReassembler: Sendable {
         totalBufferedBytes -= removed.bufferedBytes
     }
 
-    private mutating func tombstone(_ eventID: UUID, nowNanoseconds: UInt64) {
-        guard terminalEventDeadlines[eventID] == nil else { return }
-        while terminalEventDeadlines.count >= Self.maximumTerminalEventCount {
+    private mutating func tombstone(
+        _ eventID: UUID,
+        disposition: TerminalEventDisposition,
+        nowNanoseconds: UInt64
+    ) {
+        if let existing = terminalEvents[eventID] {
+            if existing.disposition == .discarded,
+               disposition == .delivered {
+                let deadline = tombstoneDeadline(nowNanoseconds: nowNanoseconds)
+                terminalEvents[eventID] = TerminalEventTombstone(
+                    deadlineNanoseconds: deadline,
+                    disposition: .delivered
+                )
+                terminalEventOrder.append(.init(
+                    eventID: eventID,
+                    deadlineNanoseconds: deadline
+                ))
+            }
+            return
+        }
+        while terminalEvents.count >= Self.maximumTerminalEventCount {
             evictFirstTerminalEvent()
         }
-        let (deadline, overflow) = nowNanoseconds.addingReportingOverflow(
-            Self.tombstoneLifetimeNanoseconds
+        let deadline = tombstoneDeadline(nowNanoseconds: nowNanoseconds)
+        terminalEvents[eventID] = TerminalEventTombstone(
+            deadlineNanoseconds: deadline,
+            disposition: disposition
         )
-        terminalEventDeadlines[eventID] = overflow ? .max : deadline
-        terminalEventOrder.append(eventID)
+        terminalEventOrder.append(.init(
+            eventID: eventID,
+            deadlineNanoseconds: deadline
+        ))
     }
 
     private mutating func expireTerminalEvents(nowNanoseconds: UInt64) {
         while terminalEventOrderHead < terminalEventOrder.count {
-            let eventID = terminalEventOrder[terminalEventOrderHead]
-            guard let deadline = terminalEventDeadlines[eventID] else {
+            let entry = terminalEventOrder[terminalEventOrderHead]
+            guard let tombstone = terminalEvents[entry.eventID],
+                  tombstone.deadlineNanoseconds == entry.deadlineNanoseconds else {
                 terminalEventOrderHead += 1
                 continue
             }
-            guard deadline <= nowNanoseconds else { break }
-            terminalEventDeadlines.removeValue(forKey: eventID)
+            guard tombstone.deadlineNanoseconds <= nowNanoseconds else { break }
+            terminalEvents.removeValue(forKey: entry.eventID)
             terminalEventOrderHead += 1
         }
         compactTerminalEventOrderIfNeeded()
@@ -343,9 +516,13 @@ package struct RecordedTouchEventReassembler: Sendable {
 
     private mutating func evictFirstTerminalEvent() {
         while terminalEventOrderHead < terminalEventOrder.count {
-            let eventID = terminalEventOrder[terminalEventOrderHead]
+            let entry = terminalEventOrder[terminalEventOrderHead]
             terminalEventOrderHead += 1
-            if terminalEventDeadlines.removeValue(forKey: eventID) != nil {
+            guard terminalEvents[entry.eventID]?.deadlineNanoseconds
+                    == entry.deadlineNanoseconds else {
+                continue
+            }
+            if terminalEvents.removeValue(forKey: entry.eventID) != nil {
                 break
             }
         }
@@ -359,6 +536,13 @@ package struct RecordedTouchEventReassembler: Sendable {
         terminalEventOrderHead = 0
     }
 
+    private func tombstoneDeadline(nowNanoseconds: UInt64) -> UInt64 {
+        let (deadline, overflow) = nowNanoseconds.addingReportingOverflow(
+            Self.tombstoneLifetimeNanoseconds
+        )
+        return overflow ? .max : deadline
+    }
+
     private static func limitDiagnostic(eventID: UUID) -> RecordedTouchTransportDiagnostic {
         .init(
             kind: .reassemblyLimitExceeded,
@@ -369,14 +553,21 @@ package struct RecordedTouchEventReassembler: Sendable {
 
 /// Best-effort publisher used by the HID dispatch path.
 ///
-/// Publishing sends one pre-encoded logical event as one or more datagrams and
-/// never throws or retries. A missing listener is normal; all other failures are
-/// returned for diagnostic logging without changing the HID operation's result.
+/// The healthy path sends one pre-encoded logical event as one or more
+/// nonblocking datagrams without retrying. A failed terminal datagram is handed
+/// to the bounded recovery mailbox; a missing listener remains a normal no-op.
+/// All failures are returned for diagnostics without changing the HID result.
 package struct RecordedTouchEventPublisher: Sendable {
     package let paths: RecordedTouchTransportPaths
+    private let datagramSender: RecordedTouchDatagramSender
 
-    package init(udid: String, baseDirectory: URL? = nil) {
+    package init(
+        udid: String,
+        baseDirectory: URL? = nil,
+        datagramSender: RecordedTouchDatagramSender = .system
+    ) {
         self.paths = RecordedTouchTransportPaths(udid: udid, baseDirectory: baseDirectory)
+        self.datagramSender = datagramSender
     }
 
     package func publish(_ event: RecordedTouchEvent) -> RecordedTouchPublishResult {
@@ -420,6 +611,10 @@ package struct RecordedTouchEventPublisher: Sendable {
             return .failed(Self.syscallDiagnostic(kind: .endpointInspectionFailed, operation: "lstat endpoint"))
         }
 
+        let listenerGeneration = try? RecordedTouchListenerGeneration(
+            ownershipPath: paths.pidfileURL.path
+        )
+
         let payloads: [Data]
         do {
             payloads = try Self.encodedPayloads(for: event)
@@ -439,7 +634,11 @@ package struct RecordedTouchEventPublisher: Sendable {
 
         let fd = Darwin.socket(AF_UNIX, SOCK_DGRAM, 0)
         guard fd >= 0 else {
-            return .failed(Self.syscallDiagnostic(kind: .socketFailed, operation: "socket"))
+            return failed(
+                Self.syscallDiagnostic(kind: .socketFailed, operation: "socket"),
+                recovering: event,
+                generation: listenerGeneration
+            )
         }
         defer { Darwin.close(fd) }
 
@@ -451,47 +650,56 @@ package struct RecordedTouchEventPublisher: Sendable {
             &sendBufferBytes,
             socklen_t(MemoryLayout<Int32>.size)
         ) == 0 else {
-            return .failed(Self.syscallDiagnostic(
-                kind: .socketFailed,
-                operation: "set send buffer"
-            ))
+            return failed(
+                Self.syscallDiagnostic(
+                    kind: .socketFailed,
+                    operation: "set send buffer"
+                ),
+                recovering: event,
+                generation: listenerGeneration
+            )
         }
 
         let statusFlags = fcntl(fd, F_GETFL, 0)
         guard statusFlags >= 0,
               fcntl(fd, F_SETFL, statusFlags | O_NONBLOCK) == 0 else {
-            return .failed(Self.syscallDiagnostic(
-                kind: .socketFailed,
-                operation: "set nonblocking sender"
-            ))
+            return failed(
+                Self.syscallDiagnostic(
+                    kind: .socketFailed,
+                    operation: "set nonblocking sender"
+                ),
+                recovering: event,
+                generation: listenerGeneration
+            )
         }
 
         for payload in payloads {
-            var address = RecordedTouchUnixDatagram.address(for: paths.socketURL.path)
-            let sent = payload.withUnsafeBytes { bytes -> Int in
-                guard let baseAddress = bytes.baseAddress else { return 0 }
-                return withUnsafePointer(to: &address) { addressPointer in
-                    addressPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                        Darwin.sendto(
-                            fd,
-                            baseAddress,
-                            bytes.count,
-                            0,
-                            socketAddress,
-                            socklen_t(MemoryLayout<sockaddr_un>.size)
-                        )
-                    }
-                }
-            }
-
-            guard sent == payload.count else {
-                if sent < 0 {
-                    return .failed(Self.syscallDiagnostic(kind: .deliveryFailed, operation: "sendto"))
-                }
-                return .failed(.init(
-                    kind: .deliveryFailed,
-                    message: "sendto wrote \(sent) of \(payload.count) bytes"
-                ))
+            switch datagramSender.send(
+                fileDescriptor: fd,
+                payload: payload,
+                socketPath: paths.socketURL.path
+            ) {
+            case .sent(let sent) where sent == payload.count:
+                continue
+            case .sent(let sent):
+                return failed(
+                    .init(
+                        kind: .deliveryFailed,
+                        message: "sendto wrote \(sent) of \(payload.count) bytes"
+                    ),
+                    recovering: event,
+                    generation: listenerGeneration
+                )
+            case .failed(let errorNumber):
+                return failed(
+                    Self.syscallDiagnostic(
+                        kind: .deliveryFailed,
+                        operation: "sendto",
+                        errorNumber: errorNumber
+                    ),
+                    recovering: event,
+                    generation: listenerGeneration
+                )
             }
         }
         return .delivered
@@ -583,12 +791,57 @@ package struct RecordedTouchEventPublisher: Sendable {
 
     private static func syscallDiagnostic(
         kind: RecordedTouchTransportDiagnostic.Kind,
-        operation: String
+        operation: String,
+        errorNumber: Int32 = errno
     ) -> RecordedTouchTransportDiagnostic {
-        let errorNumber = errno
         return .init(
             kind: kind,
             message: "\(operation) failed (errno=\(errorNumber)): \(String(cString: strerror(errorNumber)))"
+        )
+    }
+
+    private func failed(
+        _ diagnostic: RecordedTouchTransportDiagnostic,
+        recovering event: RecordedTouchEvent,
+        generation: RecordedTouchListenerGeneration?
+    ) -> RecordedTouchPublishResult {
+        guard let generation,
+              currentListenerGeneration() == generation else {
+            return .failed(diagnostic)
+        }
+        let recoveryURL = paths.recoveryURL(for: generation)
+        do {
+            let queued = try RecordedTouchRecoveryJournal.appendTerminalEvent(
+                event,
+                generation: generation,
+                at: recoveryURL
+            )
+            guard queued else { return .failed(diagnostic) }
+            guard currentListenerGeneration() == generation else {
+                RecordedTouchRecoveryJournal.remove(
+                    event: event,
+                    at: recoveryURL
+                )
+                return .failed(.init(
+                    kind: diagnostic.kind,
+                    message: "\(diagnostic.message); terminal recovery discarded after listener changed"
+                ))
+            }
+            return .failed(.init(
+                kind: diagnostic.kind,
+                message: "\(diagnostic.message); terminal recovery queued"
+            ))
+        } catch {
+            return .failed(.init(
+                kind: diagnostic.kind,
+                message: "\(diagnostic.message); terminal recovery failed: \(error.localizedDescription)"
+            ))
+        }
+    }
+
+    private func currentListenerGeneration() -> RecordedTouchListenerGeneration? {
+        try? RecordedTouchListenerGeneration(
+            ownershipPath: paths.pidfileURL.path
         )
     }
 }
@@ -661,6 +914,7 @@ package final class RecordedTouchEventListener {
     package typealias DiagnosticHandler = @Sendable (RecordedTouchTransportDiagnostic) -> Void
 
     package let paths: RecordedTouchTransportPaths
+    package let generation: RecordedTouchListenerGeneration
 
     private let state: IntakeState
     private let source: DispatchSourceRead
@@ -688,6 +942,7 @@ package final class RecordedTouchEventListener {
         let reassemblyTimer = DispatchSource.makeTimerSource(queue: queue)
 
         self.paths = paths
+        self.generation = state.generation
         self.state = state
         self.intakeQueue = queue
         self.source = source
@@ -697,11 +952,11 @@ package final class RecordedTouchEventListener {
             state.drainDatagrams()
         }
         reassemblyTimer.setEventHandler { [state] in
-            state.expireIncompleteEvents()
+            state.performMaintenance()
         }
         reassemblyTimer.schedule(
-            deadline: .now() + .seconds(1),
-            repeating: .seconds(1)
+            deadline: .now() + .milliseconds(250),
+            repeating: .milliseconds(250)
         )
         source.activate()
         reassemblyTimer.activate()
@@ -764,6 +1019,7 @@ package final class RecordedTouchEventListener {
 // the narrow `@unchecked Sendable` bridge to DispatchSource.
 private final class IntakeState: @unchecked Sendable {
     fileprivate let socketFD: Int32
+    fileprivate let generation: RecordedTouchListenerGeneration
 
     private let paths: RecordedTouchTransportPaths
     private let pidfileFD: Int32
@@ -785,6 +1041,7 @@ private final class IntakeState: @unchecked Sendable {
             let socket = try RecordedTouchUnixDatagram.bind(path: paths.socketURL.path)
 
             self.paths = paths
+            self.generation = claimedOwnership.generation
             self.pidfileFD = claimedOwnership.fd
             self.pidfileIdentity = claimedOwnership.identity
             self.socketFD = socket.fd
@@ -799,6 +1056,8 @@ private final class IntakeState: @unchecked Sendable {
 
     func drainDatagrams() {
         var buffer = [UInt8](repeating: 0, count: RecordedTouchUnixDatagram.maximumDatagramBytes)
+        var recoveryEvents: [RecordedTouchEvent] = []
+        appendRecoveryEvents(to: &recoveryEvents)
         while true {
             lock.lock()
             let closed = resourcesClosed
@@ -812,7 +1071,16 @@ private final class IntakeState: @unchecked Sendable {
             if received < 0 {
                 let errorNumber = errno
                 if errorNumber == EINTR { continue }
-                if errorNumber == EAGAIN || errorNumber == EWOULDBLOCK || errorNumber == EBADF { return }
+                if errorNumber == EAGAIN || errorNumber == EWOULDBLOCK || errorNumber == EBADF {
+                    appendRecoveryEvents(to: &recoveryEvents)
+                    deliverRecoveryEvents(&recoveryEvents)
+                    return
+                }
+                // A socket fault cannot invalidate terminal events already
+                // handed off by the recovery journal. Close those contacts
+                // before reporting the independent receive failure.
+                appendRecoveryEvents(to: &recoveryEvents)
+                deliverRecoveryEvents(&recoveryEvents)
                 emit(.init(
                     kind: .receiveFailed,
                     message: "recv failed (errno=\(errorNumber)): \(String(cString: strerror(errorNumber)))"
@@ -846,17 +1114,23 @@ private final class IntakeState: @unchecked Sendable {
                 emit(diagnostic)
             }
             if let event = output.event {
+                appendRecoveryEvents(to: &recoveryEvents)
+                deliverRecoveryEvents(
+                    &recoveryEvents,
+                    through: event.dispatchUptimeNanoseconds
+                )
                 eventHandler(event)
             }
         }
     }
 
-    func expireIncompleteEvents() {
+    func performMaintenance() {
         lock.lock()
         let closed = resourcesClosed
         lock.unlock()
         guard !closed else { return }
 
+        drainDatagrams()
         for diagnostic in reassembler.expire() {
             emit(diagnostic)
         }
@@ -872,16 +1146,76 @@ private final class IntakeState: @unchecked Sendable {
         lock.unlock()
 
         reassembler.reset()
-
+        // Stop discovery before the final journal cleanup. A publisher that
+        // already captured this generation either appends before cleanup, or
+        // observes the missing ownership path afterward and removes its late
+        // write during post-append validation.
         RecordedTouchOwnership.removePathIfOwned(paths.socketURL, identity: socketIdentity)
         Darwin.close(socketFD)
         RecordedTouchOwnership.removePathIfOwned(paths.pidfileURL, identity: pidfileIdentity)
         _ = flock(pidfileFD, LOCK_UN)
         Darwin.close(pidfileFD)
+        RecordedTouchRecoveryJournal.remove(
+            at: paths.recoveryURL(for: generation)
+        )
     }
 
     private func emit(_ diagnostic: RecordedTouchTransportDiagnostic) {
         diagnosticHandler?(diagnostic)
+    }
+
+    private func appendRecoveryEvents(
+        to events: inout [RecordedTouchEvent]
+    ) {
+        let batch: RecordedTouchRecoveryBatch
+        do {
+            guard let recovered = try RecordedTouchRecoveryJournal.consume(
+                generation: generation,
+                at: paths.recoveryURL(for: generation)
+            ) else { return }
+            batch = recovered
+        } catch {
+            emit(.init(
+                kind: .recoveryFailed,
+                message: error.localizedDescription
+            ))
+            return
+        }
+
+        for message in batch.diagnostics {
+            emit(.init(kind: .recoveryFailed, message: message))
+        }
+        events.append(contentsOf: batch.events)
+        events.sort {
+            if $0.dispatchUptimeNanoseconds == $1.dispatchUptimeNanoseconds {
+                return $0.eventID.uuidString < $1.eventID.uuidString
+            }
+            return $0.dispatchUptimeNanoseconds < $1.dispatchUptimeNanoseconds
+        }
+    }
+
+    private func deliverRecoveryEvents(
+        _ events: inout [RecordedTouchEvent],
+        through uptimeNanoseconds: UInt64 = .max
+    ) {
+        let deliverCount = events.prefix {
+            $0.dispatchUptimeNanoseconds <= uptimeNanoseconds
+        }.count
+        guard deliverCount > 0 else { return }
+
+        for event in events.prefix(deliverCount) {
+            let output = reassembler.acceptRecoveryEvent(
+                event,
+                expectedUDID: paths.udid
+            )
+            for diagnostic in output.diagnostics {
+                emit(diagnostic)
+            }
+            if let event = output.event {
+                eventHandler(event)
+            }
+        }
+        events.removeFirst(deliverCount)
     }
 }
 
@@ -916,6 +1250,7 @@ private enum RecordedTouchEventValidator {
 private struct ClaimedOwnership {
     let fd: Int32
     let identity: FileIdentity
+    let generation: RecordedTouchListenerGeneration
     let path: URL
 
     func releaseRemovingOwnedPath() {
@@ -998,10 +1333,31 @@ private enum RecordedTouchOwnership {
             removeOwnershipPathOnFailure = true
         }
 
-        try writePID(getpid(), fd: fd)
+        let generation = RecordedTouchListenerGeneration(token: UUID())
+        // Keep this order: the endpoint is absent until bind, so publishing G2
+        // first cannot admit a new publisher. It does invalidate a G1 publisher
+        // that passed lstat before stale-endpoint removal; cleanup then removes
+        // anything G1 wrote before observing the generation change.
+        try writeOwnership(
+            pid: getpid(),
+            generation: generation,
+            fd: fd
+        )
+        let recoveryURL = paths.recoveryURL(for: generation)
+        RecordedTouchRecoveryJournal.removeStaleFiles(
+            in: paths.channelDirectory,
+            udid: paths.udid,
+            keeping: recoveryURL
+        )
+        RecordedTouchRecoveryJournal.remove(at: recoveryURL)
         let identity = FileIdentity(device: fileStat.st_dev, inode: fileStat.st_ino)
         shouldClose = false
-        return ClaimedOwnership(fd: fd, identity: identity, path: paths.pidfileURL)
+        return ClaimedOwnership(
+            fd: fd,
+            identity: identity,
+            generation: generation,
+            path: paths.pidfileURL
+        )
     }
 
     static func removePathIfOwned(_ url: URL, identity: FileIdentity) {
@@ -1031,17 +1387,24 @@ private enum RecordedTouchOwnership {
               let text = String(bytes: bytes.prefix(count), encoding: .utf8) else {
             return nil
         }
-        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let firstLine = text.split(whereSeparator: \.isNewline).first else {
+            return nil
+        }
+        return pid_t(firstLine)
     }
 
-    private static func writePID(_ pid: pid_t, fd: Int32) throws {
+    private static func writeOwnership(
+        pid: pid_t,
+        generation: RecordedTouchListenerGeneration,
+        fd: Int32
+    ) throws {
         guard ftruncate(fd, 0) == 0 else {
             throw syscallError(operation: "truncate ownership file")
         }
         guard lseek(fd, 0, SEEK_SET) >= 0 else {
             throw syscallError(operation: "seek ownership file")
         }
-        let data = Data("\(pid)\n".utf8)
+        let data = Data("\(pid)\n\(generation.token.uuidString)\n".utf8)
         var offset = 0
         while offset < data.count {
             let written = data.withUnsafeBytes { bytes -> Int in
