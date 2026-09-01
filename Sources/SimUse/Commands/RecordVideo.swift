@@ -39,6 +39,12 @@ struct RecordVideo: SimUseExecutableCommand {
     @Flag(help: "Bracket a GIF with START/END marker frames (opt-in; ignored for mp4).")
     var gifMarkers: Bool = false
 
+    @Flag(help: "Overlay indicators for touch input issued through sim-use (opt-in; iOS Simulator only).")
+    var touchIndicators: Bool = false
+
+    @Option(help: "Semantic color for --touch-indicators: blue, red, orange, yellow, green, mint, teal, cyan, indigo, purple, pink, brown, gray (default: blue).")
+    var touchColor: TouchIndicatorColor?
+
     @Option(help: "Output file path. Defaults to sim-use-video-<timestamp>.<format> in the current directory.")
     var output: String?
 
@@ -62,7 +68,13 @@ struct RecordVideo: SimUseExecutableCommand {
     }
 
     func validate() throws {
-        try VideoRecordingOptions.validate(fps: fps, quality: quality, scale: scale)
+        try VideoRecordingOptions.validate(
+            fps: fps,
+            quality: quality,
+            scale: scale,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
+        )
     }
 
     func execute() async throws -> ExecutionResult {
@@ -96,6 +108,8 @@ struct RecordVideo: SimUseExecutableCommand {
         sub.scale = scale
         sub.format = format
         sub.gifMarkers = gifMarkers
+        sub.touchIndicators = touchIndicators
+        sub.touchColor = touchColor
         sub.output = output
         sub.device = device
         sub.json = json
@@ -110,7 +124,9 @@ struct RecordVideo: SimUseExecutableCommand {
             fps: fps,
             quality: quality,
             scale: scale,
-            gifMarkers: gifMarkers
+            gifMarkers: gifMarkers,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
         )
         return ExecutionResult(path: outputURL.path)
     }

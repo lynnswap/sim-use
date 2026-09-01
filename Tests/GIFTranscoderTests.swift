@@ -108,21 +108,21 @@ struct GIFTranscoderTests {
     func resolvedOptionsDefaults() {
         typealias Options = ResolvedRecordingOptions
 
-        let mp4 = Options(format: nil, output: nil, fps: nil, scale: nil, gifMarkers: false)
+        let mp4 = Options(format: nil, output: nil, fps: nil, scale: nil, gifMarkers: false, touchIndicators: .disabled)
         #expect(mp4.format == .mp4)
         #expect(mp4.fps == nil) // capture-path default (30 native / 10 fallback)
         #expect(mp4.scale == 1.0)
 
-        let gif = Options(format: .gif, output: nil, fps: nil, scale: nil, gifMarkers: false)
+        let gif = Options(format: .gif, output: nil, fps: nil, scale: nil, gifMarkers: false, touchIndicators: .disabled)
         #expect(gif.format == .gif)
         #expect(gif.fps == 10)
         #expect(gif.gifSampleFPS == 10)
         #expect(gif.scale == 0.5)
 
-        let inferred = Options(format: nil, output: "demo.gif", fps: nil, scale: nil, gifMarkers: false)
+        let inferred = Options(format: nil, output: "demo.gif", fps: nil, scale: nil, gifMarkers: false, touchIndicators: .disabled)
         #expect(inferred.format == .gif)
 
-        let explicit = Options(format: .mp4, output: "demo.gif", fps: 24, scale: 0.8, gifMarkers: false)
+        let explicit = Options(format: .mp4, output: "demo.gif", fps: 24, scale: 0.8, gifMarkers: false, touchIndicators: .disabled)
         #expect(explicit.format == .mp4) // explicit --format beats the extension
         #expect(explicit.fps == 24)
         #expect(explicit.gifSampleFPS == 24)
@@ -140,7 +140,7 @@ struct GIFTranscoderTests {
         let stale = URL(fileURLWithPath: base.path + ".recording.mp4")
         try Data([0x00]).write(to: stale)
 
-        let plan = try RecordingOutputPlan(format: nil, output: base.path, fps: nil, scale: nil, gifMarkers: false)
+        let plan = try RecordingOutputPlan(format: nil, output: base.path, fps: nil, scale: nil, gifMarkers: false, touchIndicators: false, touchColor: nil)
         #expect(plan.options.format == .gif)
         #expect(plan.recordTarget == stale)
         #expect(!FileManager.default.fileExists(atPath: stale.path))
@@ -151,7 +151,7 @@ struct GIFTranscoderTests {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("gif-plan-test-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: base) }
-        let plan = try RecordingOutputPlan(format: nil, output: base.path, fps: nil, scale: nil, gifMarkers: false)
+        let plan = try RecordingOutputPlan(format: nil, output: base.path, fps: nil, scale: nil, gifMarkers: false, touchIndicators: false, touchColor: nil)
         #expect(plan.recordTarget == plan.outputURL)
     }
 

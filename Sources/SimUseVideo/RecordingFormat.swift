@@ -28,6 +28,37 @@ public enum RecordingFormat: String, ExpressibleByArgument, Codable, Sendable {
     }
 }
 
+/// Resolved touch-indicator policy for one recording.
+///
+/// The CLI keeps color optional so it can diagnose an explicitly supplied
+/// `--touch-color` without `--touch-indicators`; internal layers receive only
+/// a valid disabled or enabled-with-color state.
+public enum TouchIndicatorConfiguration: Equatable, Sendable {
+    case disabled
+    case enabled(color: TouchIndicatorColor)
+
+    public init(enabled: Bool, color: TouchIndicatorColor?) throws {
+        guard enabled else {
+            if color != nil {
+                throw ValidationError("--touch-color requires --touch-indicators")
+            }
+            self = .disabled
+            return
+        }
+        self = .enabled(color: color ?? .blue)
+    }
+
+    public var isEnabled: Bool {
+        if case .enabled = self { return true }
+        return false
+    }
+
+    public var color: TouchIndicatorColor? {
+        guard case let .enabled(color) = self else { return nil }
+        return color
+    }
+}
+
 /// Resolve the `--format` / `--fps` / `--scale` interplay in one place
 /// so every surface applies identical semantics. Explicit `--format`
 /// wins over the `--output` extension; GIF gets lower fps/scale
@@ -44,8 +75,18 @@ public struct ResolvedRecordingOptions: Equatable, Sendable {
     /// `--gif-markers` flag of the three command surfaces, and every
     /// internal caller passes it explicitly.
     public let gifMarkers: Bool
+    /// Whether the native capture carries sim-use-issued touch indicators.
+    /// This is already resolved, so enabled state always carries its color.
+    public let touchIndicators: TouchIndicatorConfiguration
 
-    public init(format: RecordingFormat?, output: String?, fps: Int?, scale: Double?, gifMarkers: Bool) {
+    public init(
+        format: RecordingFormat?,
+        output: String?,
+        fps: Int?,
+        scale: Double?,
+        gifMarkers: Bool,
+        touchIndicators: TouchIndicatorConfiguration
+    ) {
         let resolvedFormat = format ?? RecordingFormat.infer(fromOutput: output) ?? .mp4
         let sampleFPS = fps ?? 10
         self.format = resolvedFormat
@@ -53,6 +94,7 @@ public struct ResolvedRecordingOptions: Equatable, Sendable {
         self.fps = fps ?? (resolvedFormat == .gif ? sampleFPS : nil)
         self.scale = scale ?? (resolvedFormat == .gif ? 0.5 : 1.0)
         self.gifMarkers = gifMarkers
+        self.touchIndicators = touchIndicators
     }
 
     /// Where the H.264 capture should land: the final URL for mp4, an
@@ -75,8 +117,26 @@ public struct RecordingOutputPlan {
     public let outputURL: URL
     public let recordTarget: URL
 
-    public init(format: RecordingFormat?, output: String?, fps: Int?, scale: Double?, gifMarkers: Bool) throws {
-        options = ResolvedRecordingOptions(format: format, output: output, fps: fps, scale: scale, gifMarkers: gifMarkers)
+    public init(
+        format: RecordingFormat?,
+        output: String?,
+        fps: Int?,
+        scale: Double?,
+        gifMarkers: Bool,
+        touchIndicators: Bool,
+        touchColor: TouchIndicatorColor?
+    ) throws {
+        options = ResolvedRecordingOptions(
+            format: format,
+            output: output,
+            fps: fps,
+            scale: scale,
+            gifMarkers: gifMarkers,
+            touchIndicators: try TouchIndicatorConfiguration(
+                enabled: touchIndicators,
+                color: touchColor
+            )
+        )
         RecordingFormat.warnIfOverridingExtension(explicit: format, output: output)
         outputURL = try VideoOutputFile.prepareOutputURL(output: output, fileExtension: options.format.rawValue)
         recordTarget = options.recordTarget(for: outputURL)

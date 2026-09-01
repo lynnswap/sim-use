@@ -47,6 +47,12 @@ public struct AndroidRecordVideoCommand: SimUseExecutableCommand {
     @Flag(help: "Bracket a GIF with START/END marker frames (opt-in; ignored for mp4).")
     public var gifMarkers: Bool = false
 
+    @Flag(help: "Overlay indicators for touch input issued through sim-use (opt-in; iOS Simulator only).")
+    public var touchIndicators: Bool = false
+
+    @Option(help: "Semantic color for --touch-indicators: blue, red, orange, yellow, green, mint, teal, cyan, indigo, purple, pink, brown, gray (default: blue).")
+    public var touchColor: TouchIndicatorColor?
+
     @Option(help: "Output file path. Defaults to sim-use-video-<timestamp>.<format> in the current directory.")
     public var output: String?
 
@@ -67,7 +73,13 @@ public struct AndroidRecordVideoCommand: SimUseExecutableCommand {
     public var daemonBypass: Bool { true }
 
     public func validate() throws {
-        try VideoRecordingOptions.validate(fps: fps, quality: quality, scale: scale)
+        try VideoRecordingOptions.validate(
+            fps: fps,
+            quality: quality,
+            scale: scale,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
+        )
     }
 
     public func format(_ result: ExecutionResult) -> CommandOutput {
@@ -85,7 +97,9 @@ public struct AndroidRecordVideoCommand: SimUseExecutableCommand {
             fps: fps,
             quality: quality,
             scale: scale,
-            gifMarkers: gifMarkers
+            gifMarkers: gifMarkers,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
         )
         return ExecutionResult(path: outputURL.path)
     }
@@ -113,14 +127,32 @@ public struct AndroidRecordVideoCommand: SimUseExecutableCommand {
         fps: Int?,
         quality: Int,
         scale: Double?,
-        gifMarkers: Bool
+        gifMarkers: Bool,
+        touchIndicators: Bool,
+        touchColor: TouchIndicatorColor?
     ) async throws -> URL {
+        let touchIndicatorConfiguration = try TouchIndicatorConfiguration(
+            enabled: touchIndicators,
+            color: touchColor
+        )
+        guard !touchIndicatorConfiguration.isEnabled else {
+            throw CLIError(errorDescription: "Touch indicators are currently supported only for iOS Simulator recordings. Omit --touch-indicators when recording Android.")
+        }
+
         let adb = Adb()
         try assertAdbDeviceOnline(adb: adb, serial: serial)
 
         // GIF is transcoded from a finished MP4 (see GIFTranscoder); the
         // capture loop itself always writes H.264, to plan.recordTarget.
-        let plan = try RecordingOutputPlan(format: format, output: output, fps: fps, scale: scale, gifMarkers: gifMarkers)
+        let plan = try RecordingOutputPlan(
+            format: format,
+            output: output,
+            fps: fps,
+            scale: scale,
+            gifMarkers: gifMarkers,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
+        )
         let options = plan.options
         let recordTarget = plan.recordTarget
         // Native screenrecord capture is variable-frame-rate either way;
