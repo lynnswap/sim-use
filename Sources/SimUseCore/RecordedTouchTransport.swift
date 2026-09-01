@@ -134,6 +134,15 @@ package struct RecordedTouchEventPublisher: Sendable {
             ))
         }
 
+        let statusFlags = fcntl(fd, F_GETFL, 0)
+        guard statusFlags >= 0,
+              fcntl(fd, F_SETFL, statusFlags | O_NONBLOCK) == 0 else {
+            return .failed(Self.syscallDiagnostic(
+                kind: .socketFailed,
+                operation: "set nonblocking sender"
+            ))
+        }
+
         for payload in payloads {
             var address = RecordedTouchUnixDatagram.address(for: paths.socketURL.path)
             let sent = payload.withUnsafeBytes { bytes -> Int in
