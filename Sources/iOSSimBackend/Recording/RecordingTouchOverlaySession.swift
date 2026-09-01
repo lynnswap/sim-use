@@ -131,6 +131,7 @@ private final class State: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var isActive = false
     private var isClosed = false
+    private var eventsAwaitingActivation: [RecordedTouchEvent] = []
 
     init(renderer: TouchIndicatorRenderer) {
         self.renderer = renderer
@@ -141,6 +142,11 @@ private final class State: @unchecked Sendable {
         sync {
             guard !isClosed else { return }
             isActive = true
+            let pendingEvents = eventsAwaitingActivation
+            eventsAwaitingActivation.removeAll(keepingCapacity: false)
+            for event in pendingEvents {
+                apply(event)
+            }
         }
     }
 
@@ -155,6 +161,7 @@ private final class State: @unchecked Sendable {
             guard !isClosed else { return }
             isClosed = true
             isActive = false
+            eventsAwaitingActivation.removeAll(keepingCapacity: false)
             cancelTimer()
             do {
                 try renderer.clear()
@@ -166,7 +173,16 @@ private final class State: @unchecked Sendable {
 
     private func consume(_ event: RecordedTouchEvent) {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard isActive, !isClosed else { return }
+        guard !isClosed else { return }
+        guard isActive else {
+            eventsAwaitingActivation.append(event)
+            return
+        }
+        apply(event)
+    }
+
+    private func apply(_ event: RecordedTouchEvent) {
+        dispatchPrecondition(condition: .onQueue(queue))
 
         var updates: [TouchIndicatorContactUpdate] = []
         updates.reserveCapacity(event.samples.reduce(0) { $0 + $1.contacts.count })

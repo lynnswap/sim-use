@@ -4,6 +4,7 @@ import Foundation
 import Darwin
 import AVFoundation
 import ImageIO
+import SimUseCore
 
 @Suite("Record Video Command Tests", .serialized, .enabled(if: isE2EEnabled))
 struct RecordVideoTests {
@@ -69,7 +70,7 @@ struct RecordVideoTests {
         )
     }
 
-    private enum MP4Validity {
+    private enum MP4Validity: Equatable {
         case valid
         case missing
         case invalid(String)
@@ -110,6 +111,21 @@ struct RecordVideoTests {
         #expect(result.exitCode == 0)
         #expect(result.fileSize > 10_000)
         #expect(result.stderr.contains("Press Ctrl+C"))
+    }
+
+    @Test("Touch indicator recording accepts a daemon-routed tap and writes a valid MP4")
+    func recordVideoWithTouchIndicators() async throws {
+        let result = try await invokeRecordVideo(
+            duration: 2,
+            touchIndicators: true,
+            touchColor: "orange",
+            interactionArguments: ["tap", "-x", "200", "-y", "400"]
+        )
+        defer { try? FileManager.default.removeItem(at: result.outputURL) }
+
+        #expect(result.exitCode == 0, "stderr: \(result.stderr)")
+        #expect(result.fileSize > 10_000)
+        #expect(await Self.validateMP4(at: result.outputURL) == .valid)
     }
 
     @Test("Record video uses provided directory without deleting its contents")
@@ -226,7 +242,10 @@ struct RecordVideoTests {
         quality: Int = 80,
         scale: Double = 1.0,
         duration: TimeInterval = 2.0,
-        outputPath: String? = nil
+        outputPath: String? = nil,
+        touchIndicators: Bool = false,
+        touchColor: String? = nil,
+        interactionArguments: [String]? = nil
     ) async throws -> RecordingResult {
         let udid = try TestHelpers.requireSimulatorUDID()
         let simUsePath = try TestHelpers.getSimUsePath()
@@ -241,6 +260,12 @@ struct RecordVideoTests {
         if let fps {
             arguments.append(contentsOf: ["--fps", "\(fps)"])
         }
+        if touchIndicators {
+            arguments.append("--touch-indicators")
+        }
+        if let touchColor {
+            arguments.append(contentsOf: ["--touch-color", touchColor])
+        }
         arguments.append(contentsOf: [
             "--quality", "\(quality)",
             "--scale", "\(scale)",
@@ -254,6 +279,27 @@ struct RecordVideoTests {
         process.standardError = stderrPipe
 
         try process.run()
+
+        if let interactionArguments {
+            try await Self.waitForTouchIndicatorEndpoint(udid: udid)
+            let interaction = Process()
+            interaction.executableURL = URL(fileURLWithPath: simUsePath)
+            interaction.arguments = interactionArguments + ["--udid", udid]
+            interaction.standardOutput = Pipe()
+            let interactionError = Pipe()
+            interaction.standardError = interactionError
+            try interaction.run()
+            try await TestHelpers.waitForProcessExit(
+                interaction,
+                timeout: 10,
+                description: "touch interaction did not finish during recording"
+            )
+            let errorText = String(
+                data: interactionError.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            #expect(interaction.terminationStatus == 0, "interaction stderr: \(errorText)")
+        }
 
         try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
 
@@ -287,5 +333,24 @@ struct RecordVideoTests {
             fileSize: fileSize,
             exitCode: process.terminationStatus
         )
+    }
+
+    private static func waitForTouchIndicatorEndpoint(udid: String) async throws {
+        let socketURL = RecordedTouchTransportPaths(udid: udid).socketURL
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while !FileManager.default.fileExists(atPath: socketURL.path) {
+            guard ContinuousClock.now < deadline else {
+                throw TouchIndicatorEndpointTimeout(path: socketURL.path)
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    private struct TouchIndicatorEndpointTimeout: Error, LocalizedError {
+        let path: String
+
+        var errorDescription: String? {
+            "Touch indicator endpoint did not become ready: \(path)"
+        }
     }
 }
