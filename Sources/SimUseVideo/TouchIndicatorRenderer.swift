@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import CoreGraphics
 import CoreVideo
+import Dispatch
 import Foundation
 
 /// A lifecycle update for one touch contact in the renderer's top-left-origin
@@ -14,11 +15,20 @@ package struct TouchIndicatorContactUpdate: Equatable, Sendable {
     package let contactID: UInt32
     package let phase: TouchIndicatorPhase
     package let position: CGPoint
+    /// Absolute host monotonic time, in the same uptime epoch used by
+    /// `DispatchTime.now().uptimeNanoseconds` in every local process.
+    package let uptimeNanoseconds: UInt64
 
-    package init(contactID: UInt32, phase: TouchIndicatorPhase, position: CGPoint) {
+    package init(
+        contactID: UInt32,
+        phase: TouchIndicatorPhase,
+        position: CGPoint,
+        uptimeNanoseconds: UInt64
+    ) {
         self.contactID = contactID
         self.phase = phase
         self.position = position
+        self.uptimeNanoseconds = uptimeNanoseconds
     }
 }
 
@@ -67,18 +77,24 @@ package final class TouchIndicatorRenderer {
     /// this buffer in place instead of allocating a new buffer for each tick.
     package var pixelBuffer: CVPixelBuffer { reusablePixelBuffer }
 
-    /// Whether a terminal contact still needs the recording session's managed
-    /// render tick. Active contacts redraw only when an input update arrives;
-    /// ended/cancelled contacts keep this true through their final clearing
-    /// render. Query after `render()` to decide whether to keep the tick armed.
+    /// Whether a queued update or terminal contact still needs the recording
+    /// session's managed render tick. Active contacts redraw only when another
+    /// input update arrives; ended/cancelled contacts keep this true through
+    /// their final clearing render. Query after `render()` to decide whether to
+    /// keep the tick armed.
     package var needsAnimationFrame: Bool {
-        timelines.values.contains { $0.endedAt != nil }
+        !pendingUpdates.isEmpty || timelines.values.contains { $0.endedAtNanoseconds != nil }
     }
 
     private struct ContactTimeline {
         let sequence: UInt64
         var position: CGPoint
-        var endedAt: ContinuousClock.Instant?
+        var endedAtNanoseconds: UInt64?
+    }
+
+    private struct PendingUpdate {
+        let insertionSequence: UInt64
+        let update: TouchIndicatorContactUpdate
     }
 
     private struct Presentation {
@@ -92,21 +108,24 @@ package final class TouchIndicatorRenderer {
         static let diameter: CGFloat = 44
         static let strokeWidth: CGFloat = 3
         static let fillAlpha: CGFloat = 0.5
-        static let holdDuration: Duration = .milliseconds(200)
-        static let fadeDuration: Duration = .milliseconds(200)
+        static let holdNanoseconds: UInt64 = 200_000_000
+        static let fadeNanoseconds: UInt64 = 200_000_000
+        static let totalTerminalNanoseconds = holdNanoseconds + fadeNanoseconds
         static let finalScale: CGFloat = 0.85
     }
 
     private let color: ResolvedTouchIndicatorColor
     private let colorSpace: CGColorSpace
     private let reusablePixelBuffer: CVPixelBuffer
-    private let now: () -> ContinuousClock.Instant
+    private let hostUptimeNanoseconds: () -> UInt64
 
     /// The active generation for each wire contact ID. Completed generations
     /// remain in `timelines` until their independent fade finishes.
     private var activeSequences: [UInt32: UInt64] = [:]
     private var timelines: [UInt64: ContactTimeline] = [:]
-    private var nextSequence: UInt64 = 0
+    private var nextContactSequence: UInt64 = 0
+    private var pendingUpdates: [PendingUpdate] = []
+    private var nextPendingInsertionSequence: UInt64 = 0
 
     package convenience init(
         pixelWidth: Int,
@@ -119,7 +138,7 @@ package final class TouchIndicatorRenderer {
             pixelHeight: pixelHeight,
             pixelsPerPoint: pixelsPerPoint,
             color: color,
-            now: { ContinuousClock.now }
+            hostUptimeNanoseconds: { DispatchTime.now().uptimeNanoseconds }
         )
     }
 
@@ -128,7 +147,7 @@ package final class TouchIndicatorRenderer {
         pixelHeight: Int,
         pixelsPerPoint: CGFloat,
         color: TouchIndicatorColor = .blue,
-        now: @escaping () -> ContinuousClock.Instant
+        hostUptimeNanoseconds: @escaping () -> UInt64
     ) throws {
         guard pixelWidth > 0,
               pixelHeight > 0,
@@ -169,25 +188,27 @@ package final class TouchIndicatorRenderer {
         self.color = try color.resolveSRGB()
         self.colorSpace = colorSpace
         self.reusablePixelBuffer = pixelBuffer
-        self.now = now
+        self.hostUptimeNanoseconds = hostUptimeNanoseconds
 
         try clearPixelBuffer()
     }
 
-    /// Applies one ordered group of contact updates at a single monotonic
-    /// instant. A moved/terminal update without a matching active contact is a
-    /// no-op, which avoids inventing a touch when recording starts mid-input.
+    /// Enqueues one ordered group of updates on the host's absolute monotonic
+    /// uptime timeline. `render()` applies only updates whose timestamp is due;
+    /// equal timestamps retain insertion order across calls.
     package func apply(_ updates: [TouchIndicatorContactUpdate]) {
-        let instant = now()
         for update in updates {
-            switch update.phase {
-            case .began:
-                begin(update, at: instant)
-            case .moved:
-                move(update)
-            case .ended, .cancelled:
-                end(update, at: instant)
+            pendingUpdates.append(PendingUpdate(
+                insertionSequence: nextPendingInsertionSequence,
+                update: update
+            ))
+            nextPendingInsertionSequence += 1
+        }
+        pendingUpdates.sort {
+            if $0.update.uptimeNanoseconds == $1.update.uptimeNanoseconds {
+                return $0.insertionSequence < $1.insertionSequence
             }
+            return $0.update.uptimeNanoseconds < $1.update.uptimeNanoseconds
         }
     }
 
@@ -195,7 +216,9 @@ package final class TouchIndicatorRenderer {
     /// returns the same buffer instance exposed by `pixelBuffer`.
     @discardableResult
     package func render() throws -> CVPixelBuffer {
-        let presentations = presentations(at: now())
+        let uptimeNanoseconds = hostUptimeNanoseconds()
+        applyPendingUpdates(upTo: uptimeNanoseconds)
+        let presentations = presentations(at: uptimeNanoseconds)
 
         let lockStatus = CVPixelBufferLockBaseAddress(reusablePixelBuffer, [])
         guard lockStatus == kCVReturnSuccess else {
@@ -238,25 +261,47 @@ package final class TouchIndicatorRenderer {
     package func clear() throws {
         activeSequences.removeAll(keepingCapacity: true)
         timelines.removeAll(keepingCapacity: true)
-        nextSequence = 0
+        pendingUpdates.removeAll(keepingCapacity: true)
+        nextContactSequence = 0
+        nextPendingInsertionSequence = 0
         try clearPixelBuffer()
     }
 
-    private func begin(_ update: TouchIndicatorContactUpdate, at instant: ContinuousClock.Instant) {
+    private func applyPendingUpdates(upTo uptimeNanoseconds: UInt64) {
+        let dueCount = pendingUpdates.prefix {
+            $0.update.uptimeNanoseconds <= uptimeNanoseconds
+        }.count
+        guard dueCount > 0 else { return }
+
+        for pendingUpdate in pendingUpdates.prefix(dueCount) {
+            let update = pendingUpdate.update
+            switch update.phase {
+            case .began:
+                begin(update)
+            case .moved:
+                move(update)
+            case .ended, .cancelled:
+                end(update)
+            }
+        }
+        pendingUpdates.removeFirst(dueCount)
+    }
+
+    private func begin(_ update: TouchIndicatorContactUpdate) {
         if let previousSequence = activeSequences.removeValue(forKey: update.contactID),
            var previous = timelines[previousSequence]
         {
-            previous.endedAt = instant
+            previous.endedAtNanoseconds = update.uptimeNanoseconds
             timelines[previousSequence] = previous
         }
 
-        let sequence = nextSequence
-        nextSequence += 1
+        let sequence = nextContactSequence
+        nextContactSequence += 1
         activeSequences[update.contactID] = sequence
         timelines[sequence] = ContactTimeline(
             sequence: sequence,
             position: update.position,
-            endedAt: nil
+            endedAtNanoseconds: nil
         )
     }
 
@@ -268,22 +313,22 @@ package final class TouchIndicatorRenderer {
         timelines[sequence] = timeline
     }
 
-    private func end(_ update: TouchIndicatorContactUpdate, at instant: ContinuousClock.Instant) {
+    private func end(_ update: TouchIndicatorContactUpdate) {
         guard let sequence = activeSequences.removeValue(forKey: update.contactID),
               var timeline = timelines[sequence]
         else { return }
         timeline.position = update.position
-        timeline.endedAt = instant
+        timeline.endedAtNanoseconds = update.uptimeNanoseconds
         timelines[sequence] = timeline
     }
 
-    private func presentations(at instant: ContinuousClock.Instant) -> [Presentation] {
+    private func presentations(at uptimeNanoseconds: UInt64) -> [Presentation] {
         var expiredSequences: [UInt64] = []
         var presentations: [Presentation] = []
         presentations.reserveCapacity(timelines.count)
 
         for timeline in timelines.values {
-            guard let endedAt = timeline.endedAt else {
+            guard let endedAtNanoseconds = timeline.endedAtNanoseconds else {
                 presentations.append(Presentation(
                     sequence: timeline.sequence,
                     position: timeline.position,
@@ -293,20 +338,19 @@ package final class TouchIndicatorRenderer {
                 continue
             }
 
-            let elapsed = instant - endedAt
-            let totalDuration = Style.holdDuration + Style.fadeDuration
-            if elapsed >= totalDuration {
+            let elapsedNanoseconds = uptimeNanoseconds - endedAtNanoseconds
+            if elapsedNanoseconds >= Style.totalTerminalNanoseconds {
                 expiredSequences.append(timeline.sequence)
                 continue
             }
 
             let fadeProgress: CGFloat
-            if elapsed <= Style.holdDuration {
+            if elapsedNanoseconds <= Style.holdNanoseconds {
                 fadeProgress = 0
             } else {
                 fadeProgress = CGFloat(
-                    Self.seconds(elapsed - Style.holdDuration)
-                        / Self.seconds(Style.fadeDuration)
+                    Double(elapsedNanoseconds - Style.holdNanoseconds)
+                        / Double(Style.fadeNanoseconds)
                 )
             }
             presentations.append(Presentation(
@@ -364,10 +408,5 @@ package final class TouchIndicatorRenderer {
             throw TouchIndicatorRendererError.drawingContextCreationFailed
         }
         memset(baseAddress, 0, CVPixelBufferGetDataSize(reusablePixelBuffer))
-    }
-
-    private static func seconds(_ duration: Duration) -> Double {
-        let components = duration.components
-        return Double(components.seconds) + (Double(components.attoseconds) / 1e18)
     }
 }

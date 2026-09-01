@@ -7,14 +7,14 @@ import Testing
 @Suite("Touch indicator renderer", .serialized)
 struct TouchIndicatorRendererTests {
     private final class FakeClock {
-        private(set) var current = ContinuousClock.now
+        private(set) var currentNanoseconds: UInt64 = 0
 
-        func now() -> ContinuousClock.Instant {
-            current
+        func now() -> UInt64 {
+            currentNanoseconds
         }
 
-        func advance(by duration: Duration) {
-            current = current.advanced(by: duration)
+        func advance(milliseconds: UInt64) {
+            currentNanoseconds += milliseconds * 1_000_000
         }
     }
 
@@ -65,7 +65,7 @@ struct TouchIndicatorRendererTests {
             pixelHeight: height,
             pixelsPerPoint: pixelsPerPoint,
             color: color,
-            now: clock.now
+            hostUptimeNanoseconds: clock.now
         )
     }
 
@@ -87,12 +87,14 @@ struct TouchIndicatorRendererTests {
         _ phase: TouchIndicatorPhase,
         id: UInt32 = 0,
         x: CGFloat,
-        y: CGFloat
+        y: CGFloat,
+        at uptimeNanoseconds: UInt64 = 0
     ) -> TouchIndicatorContactUpdate {
         TouchIndicatorContactUpdate(
             contactID: id,
             phase: phase,
-            position: CGPoint(x: x, y: y)
+            position: CGPoint(x: x, y: y),
+            uptimeNanoseconds: uptimeNanoseconds
         )
     }
 
@@ -207,21 +209,23 @@ struct TouchIndicatorRendererTests {
         let renderer = try makeRenderer(clock: clock)
         #expect(!renderer.needsAnimationFrame)
         renderer.apply([update(.began, x: 64, y: 64)])
+        #expect(renderer.needsAnimationFrame)
+        _ = try renderer.render()
         #expect(!renderer.needsAnimationFrame)
         renderer.apply([update(.ended, x: 64, y: 64)])
         #expect(renderer.needsAnimationFrame)
 
-        clock.advance(by: .milliseconds(200))
+        clock.advance(milliseconds: 200)
         var pixels = try snapshot(renderer.render())
         #expect(pixels.nonTransparentXs(atY: 64).count == 44)
         #expect((127...128).contains(pixels.pixel(x: 64, y: 64).alpha))
 
-        clock.advance(by: .milliseconds(100))
+        clock.advance(milliseconds: 100)
         pixels = try snapshot(renderer.render())
         #expect((41...42).contains(pixels.nonTransparentXs(atY: 64).count))
         #expect((63...64).contains(pixels.pixel(x: 64, y: 64).alpha))
 
-        clock.advance(by: .milliseconds(100))
+        clock.advance(milliseconds: 100)
         pixels = try snapshot(renderer.render())
         #expect(!pixels.hasVisiblePixel)
         #expect(!renderer.needsAnimationFrame)
@@ -234,11 +238,77 @@ struct TouchIndicatorRendererTests {
         renderer.apply([update(.began, x: 64, y: 64)])
         renderer.apply([update(.cancelled, x: 64, y: 64)])
 
-        clock.advance(by: .milliseconds(399))
+        clock.advance(milliseconds: 399)
         #expect(try snapshot(renderer.render()).hasVisiblePixel)
 
-        clock.advance(by: .milliseconds(1))
+        clock.advance(milliseconds: 1)
         #expect(try !snapshot(renderer.render()).hasVisiblePixel)
+    }
+
+    @Test("Future swipe updates appear only at their absolute host-uptime timestamps")
+    func futureSwipeTimeline() throws {
+        let clock = FakeClock()
+        let renderer = try makeRenderer(clock: clock)
+        renderer.apply([
+            update(.began, x: 32, y: 64, at: 100_000_000),
+            update(.moved, x: 64, y: 64, at: 200_000_000),
+            update(.ended, x: 96, y: 64, at: 300_000_000),
+        ])
+
+        #expect(renderer.needsAnimationFrame)
+        var pixels = try snapshot(renderer.render())
+        #expect(!pixels.hasVisiblePixel)
+
+        clock.advance(milliseconds: 100)
+        pixels = try snapshot(renderer.render())
+        #expect(pixels.pixel(x: 32, y: 64).alpha > 0)
+        #expect(pixels.pixel(x: 64, y: 64).alpha == 0)
+
+        clock.advance(milliseconds: 100)
+        pixels = try snapshot(renderer.render())
+        #expect(pixels.pixel(x: 32, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 64, y: 64).alpha > 0)
+
+        clock.advance(milliseconds: 100)
+        pixels = try snapshot(renderer.render())
+        #expect(pixels.pixel(x: 64, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 96, y: 64).alpha > 0)
+        #expect(renderer.needsAnimationFrame)
+
+        clock.advance(milliseconds: 400)
+        pixels = try snapshot(renderer.render())
+        #expect(!pixels.hasVisiblePixel)
+        #expect(!renderer.needsAnimationFrame)
+    }
+
+    @Test("A terminal update received more than 400 ms late clears without replaying stale animation")
+    func lateTerminalUpdateCatchesUp() throws {
+        let clock = FakeClock()
+        let renderer = try makeRenderer(clock: clock)
+        renderer.apply([update(.began, x: 64, y: 64, at: 0)])
+        #expect(try snapshot(renderer.render()).hasVisiblePixel)
+
+        clock.advance(milliseconds: 500)
+        renderer.apply([update(.ended, x: 64, y: 64, at: 100_000_000)])
+
+        #expect(try !snapshot(renderer.render()).hasVisiblePixel)
+        #expect(!renderer.needsAnimationFrame)
+    }
+
+    @Test("Equal host-uptime timestamps preserve insertion order across enqueue calls")
+    func equalTimestampInsertionOrder() throws {
+        let clock = FakeClock()
+        let renderer = try makeRenderer(width: 160, clock: clock)
+        renderer.apply([update(.began, x: 30, y: 64, at: 100_000_000)])
+        renderer.apply([update(.moved, x: 65, y: 64, at: 100_000_000)])
+        renderer.apply([update(.ended, x: 120, y: 64, at: 100_000_000)])
+
+        clock.advance(milliseconds: 100)
+        let pixels = try snapshot(renderer.render())
+        #expect(pixels.pixel(x: 30, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 65, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 120, y: 64).alpha > 0)
+        #expect(renderer.needsAnimationFrame)
     }
 
     @Test("Reused contact ID starts a new active generation without clearing the previous fade")
@@ -248,13 +318,13 @@ struct TouchIndicatorRendererTests {
         renderer.apply([update(.began, id: 0, x: 40, y: 64)])
         renderer.apply([update(.ended, id: 0, x: 40, y: 64)])
 
-        clock.advance(by: .milliseconds(100))
+        clock.advance(milliseconds: 100)
         renderer.apply([update(.began, id: 0, x: 120, y: 64)])
         var pixels = try snapshot(renderer.render())
         #expect(pixels.pixel(x: 40, y: 64).alpha > 0)
         #expect(pixels.pixel(x: 120, y: 64).alpha > 0)
 
-        clock.advance(by: .milliseconds(300))
+        clock.advance(milliseconds: 300)
         pixels = try snapshot(renderer.render())
         #expect(pixels.pixel(x: 40, y: 64).alpha == 0)
         #expect(pixels.pixel(x: 120, y: 64).alpha > 0)
@@ -280,12 +350,15 @@ struct TouchIndicatorRendererTests {
         renderer.apply([
             update(.began, id: 1, x: 40, y: 64),
             update(.began, id: 2, x: 120, y: 64),
+            update(.moved, id: 1, x: 80, y: 64, at: 1_000_000_000),
         ])
         #expect(try snapshot(renderer.render()).hasVisiblePixel)
 
         try renderer.clear()
         #expect(renderer.pixelBuffer === buffer)
+        #expect(!renderer.needsAnimationFrame)
         #expect(try !snapshot(renderer.pixelBuffer).hasVisiblePixel)
+        clock.advance(milliseconds: 1_000)
         #expect(try renderer.render() === buffer)
         #expect(try !snapshot(renderer.pixelBuffer).hasVisiblePixel)
     }
