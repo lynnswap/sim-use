@@ -115,8 +115,11 @@ struct RecordVideoTests {
 
     @Test("Touch indicator recording accepts a daemon-routed tap and writes a valid MP4")
     func recordVideoWithTouchIndicators() async throws {
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sim-use-touch-indicators-\(UUID().uuidString).mp4")
         let result = try await invokeRecordVideo(
             duration: 2,
+            outputPath: outputURL.path,
             touchIndicators: true,
             touchColor: "orange",
             interactionArguments: ["tap", "-x", "200", "-y", "400"]
