@@ -38,6 +38,72 @@ final class RecordedTouchTransportTests: XCTestCase {
         wait(for: [received], timeout: 2)
     }
 
+    func testLargeGestureTimelineIsChunkedWithoutDroppingSamples() throws {
+        let base = makeBaseDirectoryURL()
+        defer { removeTemporaryDirectory(base) }
+        let udid = "SIM-LARGE-GESTURE"
+        var samples: [RecordedTouchSample] = []
+        for index in 0..<120 {
+            let phase: RecordedTouchPhase
+            if index == 0 {
+                phase = .began
+            } else if index == 119 {
+                phase = .ended
+            } else {
+                phase = .moved
+            }
+            samples.append(RecordedTouchSample(
+                relativeNanoseconds: UInt64(index) * 10_000_000,
+                contacts: [
+                    .init(
+                        contactID: 0,
+                        phase: phase,
+                        x: Double(index),
+                        y: Double(index * 2)
+                    ),
+                ]
+            ))
+        }
+        let event = RecordedTouchEvent(
+            udid: udid,
+            eventID: UUID(),
+            dispatchUptimeNanoseconds: 100,
+            samples: samples
+        )
+        let expectedSamples = samples
+        XCTAssertGreaterThan(try JSONEncoder().encode(event).count, 2_048)
+
+        let receivedEvents = LockedBox<[RecordedTouchEvent]>([])
+        let receivedAllSamples = expectation(description: "listener received every chunk")
+        let listener = try RecordedTouchEventListener(
+            udid: udid,
+            baseDirectory: base,
+            onEvent: { received in
+                receivedEvents.withValue { events in
+                    events.append(received)
+                    if events.reduce(0, { $0 + $1.samples.count }) == expectedSamples.count {
+                        receivedAllSamples.fulfill()
+                    }
+                }
+            },
+            onDiagnostic: { diagnostic in
+                XCTFail("Unexpected diagnostic: \(diagnostic)")
+            }
+        )
+        defer { listener.close() }
+
+        XCTAssertEqual(
+            RecordedTouchEventPublisher(udid: udid, baseDirectory: base).publish(event),
+            .delivered
+        )
+        wait(for: [receivedAllSamples], timeout: 2)
+
+        let delivered = receivedEvents.value
+        XCTAssertGreaterThan(delivered.count, 1)
+        XCTAssertTrue(delivered.allSatisfy { $0.eventID == event.eventID })
+        XCTAssertEqual(delivered.flatMap(\.samples), expectedSamples)
+    }
+
     func testMissingListenerIsNormalNoOpAndCreatesNoFilesystemState() {
         let base = makeBaseDirectoryURL()
         let event = makeEvent(udid: "SIM-NONE")

@@ -284,7 +284,10 @@ struct RecordVideoTests {
         try process.run()
 
         if let interactionArguments {
-            try await Self.waitForTouchIndicatorEndpoint(udid: udid)
+            try await Self.waitForTouchIndicatorRecording(
+                udid: udid,
+                outputPath: configuredOutputPath
+            )
             let interaction = Process()
             interaction.executableURL = URL(fileURLWithPath: simUsePath)
             interaction.arguments = interactionArguments + ["--udid", udid]
@@ -338,12 +341,22 @@ struct RecordVideoTests {
         )
     }
 
-    private static func waitForTouchIndicatorEndpoint(udid: String) async throws {
+    private static func waitForTouchIndicatorRecording(
+        udid: String,
+        outputPath: String
+    ) async throws {
         let socketURL = RecordedTouchTransportPaths(udid: udid).socketURL
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
-        while !FileManager.default.fileExists(atPath: socketURL.path) {
+        while true {
+            let endpointExists = FileManager.default.fileExists(atPath: socketURL.path)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: outputPath)
+            let outputSize = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            if endpointExists, outputSize > 0 { return }
             guard ContinuousClock.now < deadline else {
-                throw TouchIndicatorEndpointTimeout(path: socketURL.path)
+                throw TouchIndicatorEndpointTimeout(
+                    path: socketURL.path,
+                    outputPath: outputPath
+                )
             }
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -351,9 +364,10 @@ struct RecordVideoTests {
 
     private struct TouchIndicatorEndpointTimeout: Error, LocalizedError {
         let path: String
+        let outputPath: String
 
         var errorDescription: String? {
-            "Touch indicator endpoint did not become ready: \(path)"
+            "Touch indicator recording did not become ready: endpoint=\(path), output=\(outputPath)"
         }
     }
 }

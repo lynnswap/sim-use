@@ -237,6 +237,7 @@ public struct HIDInteractor {
                 // unknowable) since the connection was made: the cached
                 // handle's mach port is dead and must not be sent through.
                 logger.info().log("Boot identity changed for simulator \(simulator.udid) (cached: \(cached.bootToken); current: \(currentToken)); discarding cached HID connection")
+                recordedTouchNormalizers.removeValue(forKey: simulator.udid)
             }
             cached.hid.disconnect()
             hidConnections.removeValue(forKey: simulator.udid)
@@ -298,16 +299,22 @@ public struct HIDInteractor {
             cached.hid.disconnect()
         }
         hidConnections.removeAll()
+        recordedTouchNormalizers.removeAll()
     }
 
-    /// Drop the cached HID connection for a single UDID. Used by
-    /// daemon stale-simulator detection (LINEIOS-216942): once the
-    /// daemon proves the simulator was shut down out of band, the
-    /// cached `FBSimulatorHID` handle is dead and must not be reused
-    /// even if the same UDID is re-booted before the daemon process
-    /// itself terminates.
-    public static func clearHIDConnection(for simulatorUDID: String) {
+    /// Drop the cached HID connection for a single UDID. A same-boot
+    /// dead-transport retry preserves scheduled touch state so the retry is
+    /// not visualized twice. Daemon stale-simulator cleanup passes
+    /// `resetRecordedTouchState: true`, because contacts from the previous
+    /// simulator boot cannot continue into the next boot.
+    public static func clearHIDConnection(
+        for simulatorUDID: String,
+        resetRecordedTouchState: Bool = false
+    ) {
         hidConnections[simulatorUDID]?.hid.disconnect()
         hidConnections.removeValue(forKey: simulatorUDID)
+        if resetRecordedTouchState {
+            recordedTouchNormalizers.removeValue(forKey: simulatorUDID)
+        }
     }
 }

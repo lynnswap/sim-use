@@ -129,9 +129,8 @@ private final class State: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.lycorp.sim-use.touch-indicator-render")
     private let queueKey = DispatchSpecificKey<UInt8>()
     private var timer: DispatchSourceTimer?
-    private var isActive = false
+    private var activationUptimeNanoseconds: UInt64?
     private var isClosed = false
-    private var eventsAwaitingActivation: [RecordedTouchEvent] = []
 
     init(renderer: TouchIndicatorRenderer) {
         self.renderer = renderer
@@ -141,12 +140,7 @@ private final class State: @unchecked Sendable {
     func activate() {
         sync {
             guard !isClosed else { return }
-            isActive = true
-            let pendingEvents = eventsAwaitingActivation
-            eventsAwaitingActivation.removeAll(keepingCapacity: false)
-            for event in pendingEvents {
-                apply(event)
-            }
+            activationUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         }
     }
 
@@ -160,8 +154,7 @@ private final class State: @unchecked Sendable {
         sync {
             guard !isClosed else { return }
             isClosed = true
-            isActive = false
-            eventsAwaitingActivation.removeAll(keepingCapacity: false)
+            activationUptimeNanoseconds = nil
             cancelTimer()
             do {
                 try renderer.clear()
@@ -174,10 +167,8 @@ private final class State: @unchecked Sendable {
     private func consume(_ event: RecordedTouchEvent) {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !isClosed else { return }
-        guard isActive else {
-            eventsAwaitingActivation.append(event)
-            return
-        }
+        guard let activationUptimeNanoseconds,
+              event.dispatchUptimeNanoseconds >= activationUptimeNanoseconds else { return }
         apply(event)
     }
 

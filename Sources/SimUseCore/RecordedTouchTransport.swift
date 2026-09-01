@@ -98,11 +98,14 @@ package struct RecordedTouchEventPublisher: Sendable {
             return .failed(Self.syscallDiagnostic(kind: .endpointInspectionFailed, operation: "lstat endpoint"))
         }
 
-        let payload: Data
+        let payloads: [Data]
         do {
-            payload = try JSONEncoder().encode(event)
+            payloads = try Self.encodedPayloads(for: event)
         } catch {
-            return .failed(.init(kind: .encodingFailed, message: error.localizedDescription))
+            let kind: RecordedTouchTransportDiagnostic.Kind = error is OversizedRecordedTouchSample
+                ? .datagramTooLarge
+                : .encodingFailed
+            return .failed(.init(kind: kind, message: error.localizedDescription))
         }
 
         do {
@@ -117,33 +120,93 @@ package struct RecordedTouchEventPublisher: Sendable {
         }
         defer { Darwin.close(fd) }
 
-        var address = RecordedTouchUnixDatagram.address(for: paths.socketURL.path)
-        let sent = payload.withUnsafeBytes { bytes -> Int in
-            guard let baseAddress = bytes.baseAddress else { return 0 }
-            return withUnsafePointer(to: &address) { addressPointer in
-                addressPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                    Darwin.sendto(
-                        fd,
-                        baseAddress,
-                        bytes.count,
-                        0,
-                        socketAddress,
-                        socklen_t(MemoryLayout<sockaddr_un>.size)
-                    )
+        var sendBufferBytes: Int32 = RecordedTouchUnixDatagram.socketBufferBytes
+        guard setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_SNDBUF,
+            &sendBufferBytes,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            return .failed(Self.syscallDiagnostic(
+                kind: .socketFailed,
+                operation: "set send buffer"
+            ))
+        }
+
+        for payload in payloads {
+            var address = RecordedTouchUnixDatagram.address(for: paths.socketURL.path)
+            let sent = payload.withUnsafeBytes { bytes -> Int in
+                guard let baseAddress = bytes.baseAddress else { return 0 }
+                return withUnsafePointer(to: &address) { addressPointer in
+                    addressPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                        Darwin.sendto(
+                            fd,
+                            baseAddress,
+                            bytes.count,
+                            0,
+                            socketAddress,
+                            socklen_t(MemoryLayout<sockaddr_un>.size)
+                        )
+                    }
                 }
+            }
+
+            guard sent == payload.count else {
+                if sent < 0 {
+                    return .failed(Self.syscallDiagnostic(kind: .deliveryFailed, operation: "sendto"))
+                }
+                return .failed(.init(
+                    kind: .deliveryFailed,
+                    message: "sendto wrote \(sent) of \(payload.count) bytes"
+                ))
+            }
+        }
+        return .delivered
+    }
+
+    /// macOS commonly caps local datagrams at 2048 bytes. Keep each JSON
+    /// payload below that limit and preserve the original event ID/timeline
+    /// across chunks; Unix datagrams from one socket retain send order.
+    private static func encodedPayloads(for event: RecordedTouchEvent) throws -> [Data] {
+        let encoder = JSONEncoder()
+        let whole = try encoder.encode(event)
+        guard whole.count > RecordedTouchUnixDatagram.safePayloadBytes else {
+            return [whole]
+        }
+
+        var payloads: [Data] = []
+        var chunkSamples: [RecordedTouchSample] = []
+        for sample in event.samples {
+            let candidate = event.withSamples(chunkSamples + [sample])
+            let candidatePayload = try encoder.encode(candidate)
+            if candidatePayload.count <= RecordedTouchUnixDatagram.safePayloadBytes {
+                chunkSamples.append(sample)
+                continue
+            }
+
+            guard !chunkSamples.isEmpty else {
+                throw OversizedRecordedTouchSample(
+                    encodedBytes: candidatePayload.count,
+                    limit: RecordedTouchUnixDatagram.safePayloadBytes
+                )
+            }
+            payloads.append(try encoder.encode(event.withSamples(chunkSamples)))
+            chunkSamples = [sample]
+
+            let singlePayload = try encoder.encode(event.withSamples(chunkSamples))
+            guard singlePayload.count <= RecordedTouchUnixDatagram.safePayloadBytes else {
+                throw OversizedRecordedTouchSample(
+                    encodedBytes: singlePayload.count,
+                    limit: RecordedTouchUnixDatagram.safePayloadBytes
+                )
             }
         }
 
-        guard sent == payload.count else {
-            if sent < 0 {
-                return .failed(Self.syscallDiagnostic(kind: .deliveryFailed, operation: "sendto"))
-            }
-            return .failed(.init(
-                kind: .deliveryFailed,
-                message: "sendto wrote \(sent) of \(payload.count) bytes"
-            ))
+        if !chunkSamples.isEmpty {
+            payloads.append(try encoder.encode(event.withSamples(chunkSamples)))
         }
-        return .delivered
+        return payloads
     }
 
     private static func syscallDiagnostic(
@@ -155,6 +218,27 @@ package struct RecordedTouchEventPublisher: Sendable {
             kind: kind,
             message: "\(operation) failed (errno=\(errorNumber)): \(String(cString: strerror(errorNumber)))"
         )
+    }
+}
+
+private extension RecordedTouchEvent {
+    func withSamples(_ samples: [RecordedTouchSample]) -> RecordedTouchEvent {
+        RecordedTouchEvent(
+            version: version,
+            udid: udid,
+            eventID: eventID,
+            dispatchUptimeNanoseconds: dispatchUptimeNanoseconds,
+            samples: samples
+        )
+    }
+}
+
+private struct OversizedRecordedTouchSample: Error, LocalizedError {
+    let encodedBytes: Int
+    let limit: Int
+
+    var errorDescription: String? {
+        "One recorded-touch sample encodes to \(encodedBytes) bytes, exceeding the safe local datagram limit of \(limit) bytes."
     }
 }
 
@@ -604,6 +688,8 @@ private struct FileIdentity: Equatable {
 
 private enum RecordedTouchUnixDatagram {
     static let maximumDatagramBytes = 1024 * 1024
+    static let safePayloadBytes = 1_800
+    static let socketBufferBytes: Int32 = 1024 * 1024
 
     static func bind(path: String) throws -> BoundSocket {
         try ensurePathFits(path)
@@ -622,6 +708,17 @@ private enum RecordedTouchUnixDatagram {
                     )
                 }
             }
+        }
+
+        var receiveBufferBytes: Int32 = socketBufferBytes
+        guard setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &receiveBufferBytes,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            throw syscallError(operation: "set receive buffer")
         }
 
         var address = address(for: path)
