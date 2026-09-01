@@ -36,6 +36,7 @@ public struct HIDInteractor {
     }
 
     private static var hidConnections: [String: CachedConnection] = [:]
+    private static var recordedTouchNormalizers: [String: RecordedTouchEventNormalizer] = [:]
 
     /// Configurable stabilization delay to ensure HID events are fully processed
     /// Can be set via SIM_USE_HID_STABILIZATION_MS environment variable
@@ -108,27 +109,76 @@ public struct HIDInteractor {
     }
 
     public static func performHIDEvent(_ event: FBSimulatorHIDEvent, in session: Session, logger: SimUseLogger) async throws {
+        publishRecordedTouchEvent(event, in: session, logger: logger)
         do {
             try await performHIDEventOnce(event, in: session, logger: logger)
         } catch {
             // Fail-invalidate + cautious retry-once: see HIDPerformRecovery
             // for the decision rules and why only dead-transport errors
             // are safe to re-perform.
-            try await HIDPerformRecovery.recover(from: error, invalidate: {
-                logger.error().log("HID event failed (\(error.localizedDescription)); dropping cached HID connection for \(session.simulatorUDID)")
-                clearHIDConnection(for: session.simulatorUDID)
-            }, rebuildAndRetry: {
-                logger.info().log("Dead HID transport for \(session.simulatorUDID); rebuilding session and retrying once...")
-                let freshSession = try await makeSession(for: session.simulatorUDID, logger: logger)
-                do {
-                    try await performHIDEventOnce(event, in: freshSession, logger: logger)
-                } catch {
-                    // Keep the "a failed perform never leaves its
-                    // connection cached" invariant on the retry path too.
+            do {
+                try await HIDPerformRecovery.recover(from: error, invalidate: {
+                    logger.error().log("HID event failed (\(error.localizedDescription)); dropping cached HID connection for \(session.simulatorUDID)")
                     clearHIDConnection(for: session.simulatorUDID)
-                    throw error
-                }
-            })
+                }, rebuildAndRetry: {
+                    logger.info().log("Dead HID transport for \(session.simulatorUDID); rebuilding session and retrying once...")
+                    let freshSession = try await makeSession(for: session.simulatorUDID, logger: logger)
+                    do {
+                        try await performHIDEventOnce(event, in: freshSession, logger: logger)
+                    } catch {
+                        // Keep the "a failed perform never leaves its
+                        // connection cached" invariant on the retry path too.
+                        clearHIDConnection(for: session.simulatorUDID)
+                        throw error
+                    }
+                })
+            } catch {
+                publishRecordedTouchCancellation(for: session.simulatorUDID, logger: logger)
+                throw error
+            }
+        }
+    }
+
+    private static func publishRecordedTouchEvent(
+        _ event: FBSimulatorHIDEvent,
+        in session: Session,
+        logger: SimUseLogger
+    ) {
+        let normalizer = recordedTouchNormalizers[session.simulatorUDID] ?? RecordedTouchEventNormalizer()
+        recordedTouchNormalizers[session.simulatorUDID] = normalizer
+        do {
+            guard let recordedEvent = try normalizer.event(
+                from: event,
+                udid: session.simulatorUDID
+            ) else { return }
+            logRecordedTouchPublishResult(
+                RecordedTouchEventPublisher(udid: session.simulatorUDID).publish(recordedEvent),
+                logger: logger
+            )
+        } catch {
+            logger.error().log("Touch indicator event normalization failed; HID input will continue: \(error.localizedDescription)")
+        }
+    }
+
+    private static func publishRecordedTouchCancellation(
+        for simulatorUDID: String,
+        logger: SimUseLogger
+    ) {
+        guard let event = recordedTouchNormalizers[simulatorUDID]?.cancellationEvent(
+            udid: simulatorUDID
+        ) else { return }
+        logRecordedTouchPublishResult(
+            RecordedTouchEventPublisher(udid: simulatorUDID).publish(event),
+            logger: logger
+        )
+    }
+
+    private static func logRecordedTouchPublishResult(
+        _ result: RecordedTouchPublishResult,
+        logger: SimUseLogger
+    ) {
+        if case let .failed(diagnostic) = result {
+            logger.error().log("Touch indicator event delivery failed; HID input will continue: \(diagnostic.description)")
         }
     }
 
@@ -260,4 +310,4 @@ public struct HIDInteractor {
         hidConnections[simulatorUDID]?.hid.disconnect()
         hidConnections.removeValue(forKey: simulatorUDID)
     }
-} 
+}
