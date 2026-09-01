@@ -8,6 +8,12 @@ import Foundation
 /// dimension up to an even value. Touch coordinates remain logical HID points,
 /// so the renderer scale is the simulator's pixels-per-point multiplied by the
 /// requested video scale.
+///
+/// Do not swap these dimensions or rotate touch points for interface
+/// orientation. The pinned stream applies no rotation, and a live Xcode 27
+/// landscape probe confirmed that its mounted IOSurface and HID remain in
+/// fixed native-portrait axes while UI content rotates inside the raw buffer.
+/// Revalidate this if the pinned framebuffer contract changes.
 struct TouchIndicatorVideoGeometry: Equatable, Sendable {
     let pixelWidth: Int
     let pixelHeight: Int

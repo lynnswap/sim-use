@@ -18,6 +18,7 @@ public struct HIDInteractor {
         public let simulatorUDID: String
         public let simulator: FBSimulator
         public let hid: FBSimulatorHID
+        let recordedTouchNormalizer: RecordedTouchEventNormalizer
     }
 
     // Cache for HID connections per simulator. Each entry carries the
@@ -36,7 +37,7 @@ public struct HIDInteractor {
     }
 
     private static var hidConnections: [String: CachedConnection] = [:]
-    private static var recordedTouchNormalizers: [String: RecordedTouchEventNormalizer] = [:]
+    private static let recordedTouchStateStore = RecordedTouchStateStore()
 
     private final class HIDDispatchAttempt {
         var didScheduleTouch = false
@@ -108,8 +109,17 @@ public struct HIDInteractor {
         }
         logger.info().log("Simulator state verified: booted")
 
-        let hid = try await getOrCreateHIDConnection(for: simulator, logger: logger)
-        return Session(simulatorUDID: simulatorUDID, simulator: simulator, hid: hid)
+        let connection = try await getOrCreateHIDConnection(for: simulator, logger: logger)
+        let normalizer = recordedTouchStateStore.normalizer(
+            for: simulatorUDID,
+            bootToken: connection.bootToken
+        )
+        return Session(
+            simulatorUDID: simulatorUDID,
+            simulator: simulator,
+            hid: connection.hid,
+            recordedTouchNormalizer: normalizer
+        )
     }
 
     public static func performHIDEvent(_ event: FBSimulatorHIDEvent, in session: Session, logger: SimUseLogger) async throws {
@@ -161,11 +171,10 @@ public struct HIDInteractor {
     private static func publishRecordedTouchEvent(
         _ event: FBSimulatorHIDEvent,
         for simulatorUDID: String,
+        normalizer: RecordedTouchEventNormalizer,
         dispatchUptimeNanoseconds: UInt64,
         logger: SimUseLogger
     ) {
-        let normalizer = recordedTouchNormalizers[simulatorUDID] ?? RecordedTouchEventNormalizer()
-        recordedTouchNormalizers[simulatorUDID] = normalizer
         do {
             guard let recordedEvent = try normalizer.event(
                 from: event,
@@ -185,7 +194,7 @@ public struct HIDInteractor {
         for simulatorUDID: String,
         logger: SimUseLogger
     ) {
-        guard let event = recordedTouchNormalizers[simulatorUDID]?.cancellationEvent(
+        guard let event = recordedTouchStateStore.currentNormalizer(for: simulatorUDID)?.cancellationEvent(
             udid: simulatorUDID
         ) else { return }
         logRecordedTouchPublishResult(
@@ -260,6 +269,7 @@ public struct HIDInteractor {
                 publishRecordedTouchEvent(
                     primitive,
                     for: udid,
+                    normalizer: session.recordedTouchNormalizer,
                     dispatchUptimeNanoseconds: dispatchUptimeNanoseconds,
                     logger: logger
                 )
@@ -299,13 +309,16 @@ public struct HIDInteractor {
     }
 
     // Get or create a cached HID connection (matching CompanionLib's connectToHID behavior)
-    private static func getOrCreateHIDConnection(for simulator: FBSimulator, logger: SimUseLogger) async throws -> FBSimulatorHID {
+    private static func getOrCreateHIDConnection(
+        for simulator: FBSimulator,
+        logger: SimUseLogger
+    ) async throws -> CachedConnection {
         let currentToken = HIDBootIdentity.token(dataDirectory: simulator.dataDirectory, udid: simulator.udid)
         if let cached = hidConnections[simulator.udid] {
             let sameBoot = HIDBootIdentity.isReusable(cachedToken: cached.bootToken, currentToken: currentToken)
             if sameBoot && cached.transportTrusted {
                 logger.info().log("Using existing HID connection for simulator \(simulator.udid)")
-                return cached.hid
+                return cached
             }
             if sameBoot {
                 // Same boot, but the transport was auto-selected inside
@@ -318,7 +331,6 @@ public struct HIDInteractor {
                 // unknowable) since the connection was made: the cached
                 // handle's mach port is dead and must not be sent through.
                 logger.info().log("Boot identity changed for simulator \(simulator.udid) (cached: \(cached.bootToken); current: \(currentToken)); discarding cached HID connection")
-                recordedTouchNormalizers.removeValue(forKey: simulator.udid)
             }
             cached.hid.disconnect()
             hidConnections.removeValue(forKey: simulator.udid)
@@ -349,15 +361,19 @@ public struct HIDInteractor {
         // only the auto-selection is window-gated.
         let transportTrusted = transportOverride != nil
             || HIDBootIdentity.isTransportSelectionTrustworthy(token: currentToken, now: Date())
-        hidConnections[simulator.udid] = CachedConnection(
-            hid: hid, bootToken: currentToken, transportTrusted: transportTrusted)
+        let connection = CachedConnection(
+            hid: hid,
+            bootToken: currentToken,
+            transportTrusted: transportTrusted
+        )
+        hidConnections[simulator.udid] = connection
         if transportTrusted {
             logger.info().log("HID connection created and cached for simulator \(simulator.udid)")
         } else {
             logger.info().log("HID connection created for simulator \(simulator.udid) inside the transport trust window (launchd_sim uptime < \(Int(HIDBootIdentity.transportTrustWindow)) s); the next command re-derives the transport selection")
         }
 
-        return hid
+        return connection
     }
 
     /// Whether a `dtuhidd` currently lives in the simulator's
@@ -380,7 +396,7 @@ public struct HIDInteractor {
             cached.hid.disconnect()
         }
         hidConnections.removeAll()
-        recordedTouchNormalizers.removeAll()
+        recordedTouchStateStore.removeAll()
     }
 
     /// Drop the cached HID connection for a single UDID. A same-boot
@@ -397,7 +413,7 @@ public struct HIDInteractor {
         hidConnections[simulatorUDID]?.hid.disconnect()
         hidConnections.removeValue(forKey: simulatorUDID)
         if resetRecordedTouchState {
-            recordedTouchNormalizers.removeValue(forKey: simulatorUDID)
+            recordedTouchStateStore.removeValue(for: simulatorUDID)
         }
     }
 }
