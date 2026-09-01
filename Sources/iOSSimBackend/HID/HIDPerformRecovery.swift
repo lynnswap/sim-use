@@ -41,6 +41,10 @@ import Foundation
 /// middle of a composite while earlier touches were delivered) — gets
 /// `invalidateOnly`: the current command fails, the next one self-heals
 /// against a fresh connection.
+///
+/// Error text alone is not sufficient once a composite has acknowledged a
+/// touch primitive. `recover` therefore also requires the caller's
+/// `wholeEventRetryIsSafe` fact; acknowledged touch input is never replayed.
 public enum HIDPerformRecovery: Equatable {
     case invalidateAndRetry
     case invalidateOnly
@@ -71,7 +75,10 @@ public enum HIDPerformRecovery: Equatable {
 
     /// Applies the recovery decision for a failed perform. `invalidate`
     /// always runs first so the rebuild path cannot observe the dead
-    /// cache entry; `rebuildAndRetry` runs at most once and its error —
+    /// cache entry. `wholeEventRetryIsSafe` is false after any touch primitive
+    /// in the failed attempt was acknowledged, because replay would duplicate
+    /// already scheduled input. Otherwise `rebuildAndRetry` runs at most once
+    /// and its error —
     /// fresher than the original (e.g. "is not booted. Current state"
     /// when the simulator went away for good, which the daemon
     /// classifies as stale) — is the one propagated.
@@ -82,11 +89,13 @@ public enum HIDPerformRecovery: Equatable {
     @MainActor
     public static func recover(
         from error: Error,
+        wholeEventRetryIsSafe: Bool,
         invalidate: () -> Void,
         rebuildAndRetry: () async throws -> Void
     ) async throws {
         invalidate()
-        guard classify(error) == .invalidateAndRetry else {
+        guard wholeEventRetryIsSafe,
+              classify(error) == .invalidateAndRetry else {
             throw error
         }
         try await rebuildAndRetry()

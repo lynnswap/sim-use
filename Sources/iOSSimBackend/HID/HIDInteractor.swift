@@ -38,6 +38,10 @@ public struct HIDInteractor {
     private static var hidConnections: [String: CachedConnection] = [:]
     private static var recordedTouchNormalizers: [String: RecordedTouchEventNormalizer] = [:]
 
+    private final class HIDDispatchAttempt {
+        var didScheduleTouch = false
+    }
+
     /// Configurable stabilization delay to ensure HID events are fully processed
     /// Can be set via SIM_USE_HID_STABILIZATION_MS environment variable
     private static var stabilizationDelayMs: UInt64 {
@@ -109,29 +113,44 @@ public struct HIDInteractor {
     }
 
     public static func performHIDEvent(_ event: FBSimulatorHIDEvent, in session: Session, logger: SimUseLogger) async throws {
-        publishRecordedTouchEvent(event, in: session, logger: logger)
+        let initialAttempt = HIDDispatchAttempt()
         do {
-            try await performHIDEventOnce(event, in: session, logger: logger)
+            try await performHIDEventOnce(
+                event,
+                in: session,
+                attempt: initialAttempt,
+                logger: logger
+            )
         } catch {
             // Fail-invalidate + cautious retry-once: see HIDPerformRecovery
             // for the decision rules and why only dead-transport errors
             // are safe to re-perform.
             do {
-                try await HIDPerformRecovery.recover(from: error, invalidate: {
-                    logger.error().log("HID event failed (\(error.localizedDescription)); dropping cached HID connection for \(session.simulatorUDID)")
-                    clearHIDConnection(for: session.simulatorUDID)
-                }, rebuildAndRetry: {
-                    logger.info().log("Dead HID transport for \(session.simulatorUDID); rebuilding session and retrying once...")
-                    let freshSession = try await makeSession(for: session.simulatorUDID, logger: logger)
-                    do {
-                        try await performHIDEventOnce(event, in: freshSession, logger: logger)
-                    } catch {
-                        // Keep the "a failed perform never leaves its
-                        // connection cached" invariant on the retry path too.
+                try await HIDPerformRecovery.recover(
+                    from: error,
+                    wholeEventRetryIsSafe: !initialAttempt.didScheduleTouch,
+                    invalidate: {
+                        logger.error().log("HID event failed (\(error.localizedDescription)); dropping cached HID connection for \(session.simulatorUDID)")
                         clearHIDConnection(for: session.simulatorUDID)
-                        throw error
+                    }, rebuildAndRetry: {
+                        logger.info().log("Dead HID transport for \(session.simulatorUDID); rebuilding session and retrying once...")
+                        let freshSession = try await makeSession(for: session.simulatorUDID, logger: logger)
+                        let retryAttempt = HIDDispatchAttempt()
+                        do {
+                            try await performHIDEventOnce(
+                                event,
+                                in: freshSession,
+                                attempt: retryAttempt,
+                                logger: logger
+                            )
+                        } catch {
+                            // Keep the "a failed perform never leaves its
+                            // connection cached" invariant on the retry path too.
+                            clearHIDConnection(for: session.simulatorUDID)
+                            throw error
+                        }
                     }
-                })
+                )
             } catch {
                 publishRecordedTouchCancellation(for: session.simulatorUDID, logger: logger)
                 throw error
@@ -141,18 +160,20 @@ public struct HIDInteractor {
 
     private static func publishRecordedTouchEvent(
         _ event: FBSimulatorHIDEvent,
-        in session: Session,
+        for simulatorUDID: String,
+        dispatchUptimeNanoseconds: UInt64,
         logger: SimUseLogger
     ) {
-        let normalizer = recordedTouchNormalizers[session.simulatorUDID] ?? RecordedTouchEventNormalizer()
-        recordedTouchNormalizers[session.simulatorUDID] = normalizer
+        let normalizer = recordedTouchNormalizers[simulatorUDID] ?? RecordedTouchEventNormalizer()
+        recordedTouchNormalizers[simulatorUDID] = normalizer
         do {
             guard let recordedEvent = try normalizer.event(
                 from: event,
-                udid: session.simulatorUDID
+                udid: simulatorUDID,
+                dispatchUptimeNanoseconds: dispatchUptimeNanoseconds
             ) else { return }
             logRecordedTouchPublishResult(
-                RecordedTouchEventPublisher(udid: session.simulatorUDID).publish(recordedEvent),
+                RecordedTouchEventPublisher(udid: simulatorUDID).publish(recordedEvent),
                 logger: logger
             )
         } catch {
@@ -182,7 +203,12 @@ public struct HIDInteractor {
         }
     }
 
-    private static func performHIDEventOnce(_ event: FBSimulatorHIDEvent, in session: Session, logger: SimUseLogger) async throws {
+    private static func performHIDEventOnce(
+        _ event: FBSimulatorHIDEvent,
+        in session: Session,
+        attempt: HIDDispatchAttempt,
+        logger: SimUseLogger
+    ) async throws {
         logger.info().log("Performing HID event...")
         let timeoutMs = sendTimeoutMs
         // Capture the hid handle, not the whole Session: FBSimulatorHID is
@@ -190,25 +216,80 @@ public struct HIDInteractor {
         // non-Sendable FBSimulator and would trip strict-concurrency
         // checking inside the @Sendable deadline closure.
         let hid = session.hid
-        if timeoutMs > 0 {
-            let udid = session.simulatorUDID
-            try await HIDSendDeadline.run(milliseconds: timeoutMs) {
-                try await hid.send(event: event, logger: logger)
-            } onTimeout: {
-                CLIError(errorDescription: """
-                HID event delivery timed out after \(timeoutMs) ms; the connection to \
-                simulator \(udid) may be dead (rebooted mid-command?). The cached \
-                connection is dropped and rebuilt on the next command.
-                """)
+        let udid = session.simulatorUDID
+        try await HIDEventDispatchExecutor.perform(
+            event,
+            sendPrimitive: { primitive in
+                logger.info().log("Sending \(primitive)")
+                if timeoutMs > 0 {
+                    return try await HIDSendDeadline.run(milliseconds: timeoutMs) {
+                        let dispatchUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+                        try await primitive.sendAsync(on: hid)
+                        return dispatchUptimeNanoseconds
+                    } onTimeout: {
+                        Self.hidTimeoutError(timeoutMs: timeoutMs, simulatorUDID: udid)
+                    }
+                }
+                let dispatchUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+                try await primitive.sendAsync(on: hid)
+                return dispatchUptimeNanoseconds
+            },
+            sleep: { duration in
+                logger.info().log("Delay \(duration)s")
+                try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+            },
+            flush: {
+                // Do not call `hid.send` for every primitive: that would flush
+                // the DTUHID transport after every phase and break gesture
+                // timing. The pinned FB API exposes primitive `sendAsync` but
+                // keeps `flush()` internal; an empty composite is its public
+                // zero-payload path to the same one-shot final flush.
+                if timeoutMs > 0 {
+                    try await HIDSendDeadline.run(milliseconds: timeoutMs) {
+                        try await hid.send(event: .composite([]), logger: logger)
+                    } onTimeout: {
+                        Self.hidTimeoutError(timeoutMs: timeoutMs, simulatorUDID: udid)
+                    }
+                } else {
+                    try await hid.send(event: .composite([]), logger: logger)
+                }
+            },
+            didSendPrimitive: { primitive, dispatchUptimeNanoseconds in
+                guard Self.isTouchPrimitive(primitive) else { return }
+                attempt.didScheduleTouch = true
+                publishRecordedTouchEvent(
+                    primitive,
+                    for: udid,
+                    dispatchUptimeNanoseconds: dispatchUptimeNanoseconds,
+                    logger: logger
+                )
             }
-        } else {
-            try await session.hid.send(event: event, logger: logger)
-        }
+        )
         logger.info().log("HID event performed successfully.")
 
         if stabilizationDelayMs > 0 {
             logger.info().log("Applying stabilization delay of \(stabilizationDelayMs)ms...")
             try await Task.sleep(nanoseconds: stabilizationDelayMs * 1_000_000)
+        }
+    }
+
+    nonisolated private static func hidTimeoutError(
+        timeoutMs: UInt64,
+        simulatorUDID: String
+    ) -> CLIError {
+        CLIError(errorDescription: """
+        HID event delivery timed out after \(timeoutMs) ms; the connection to \
+        simulator \(simulatorUDID) may be dead (rebooted mid-command?). The cached \
+        connection is dropped and rebuilt on the next command.
+        """)
+    }
+
+    private static func isTouchPrimitive(_ event: FBSimulatorHIDEvent) -> Bool {
+        switch event {
+        case .touch, .twoFingerTouch:
+            true
+        default:
+            false
         }
     }
 
@@ -303,8 +384,10 @@ public struct HIDInteractor {
     }
 
     /// Drop the cached HID connection for a single UDID. A same-boot
-    /// dead-transport retry preserves scheduled touch state so the retry is
-    /// not visualized twice. Daemon stale-simulator cleanup passes
+    /// dead-transport retry preserves touch state from previously successful
+    /// commands. Successful touch primitives commit immediately, and a whole
+    /// event is retried only when the failed attempt committed none. Daemon
+    /// stale-simulator cleanup passes
     /// `resetRecordedTouchState: true`, because contacts from the previous
     /// simulator boot cannot continue into the next boot.
     public static func clearHIDConnection(

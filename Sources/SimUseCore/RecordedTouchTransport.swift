@@ -40,6 +40,9 @@ package struct RecordedTouchTransportDiagnostic: Equatable, Sendable, CustomStri
         case unorderedSamples = "unordered_samples"
         case receiveFailed = "receive_failed"
         case datagramTooLarge = "datagram_too_large"
+        case invalidChunkMetadata = "invalid_chunk_metadata"
+        case incompleteEventDiscarded = "incomplete_event_discarded"
+        case reassemblyLimitExceeded = "reassembly_limit_exceeded"
     }
 
     package let kind: Kind
@@ -61,11 +64,303 @@ package enum RecordedTouchPublishResult: Equatable, Sendable {
     case failed(RecordedTouchTransportDiagnostic)
 }
 
+/// Versioned wire envelope for one fragment of a logical touch event.
+/// `RecordedTouchEvent` remains the callback value; fragmentation is owned by
+/// the transport and never leaks to listeners.
+package struct RecordedTouchEventDatagram: Codable, Equatable, Sendable {
+    package static let currentVersion = 1
+
+    package let version: Int
+    package let event: RecordedTouchEvent
+    package let chunkIndex: Int
+    package let chunkCount: Int
+
+    package init(
+        version: Int = RecordedTouchEventDatagram.currentVersion,
+        event: RecordedTouchEvent,
+        chunkIndex: Int,
+        chunkCount: Int
+    ) {
+        self.version = version
+        self.event = event
+        self.chunkIndex = chunkIndex
+        self.chunkCount = chunkCount
+    }
+}
+
+package struct RecordedTouchReassemblyOutput: Equatable, Sendable {
+    package let event: RecordedTouchEvent?
+    package let diagnostics: [RecordedTouchTransportDiagnostic]
+
+    package init(
+        event: RecordedTouchEvent? = nil,
+        diagnostics: [RecordedTouchTransportDiagnostic] = []
+    ) {
+        self.event = event
+        self.diagnostics = diagnostics
+    }
+}
+
+/// Listener-side owner of the complete-event callback invariant.
+///
+/// The listener's serial intake queue owns this value. It accepts out-of-order
+/// chunks, suppresses duplicate/replayed datagrams, and returns a logical event
+/// only after every chunk has arrived and the reconstructed timeline validates.
+package struct RecordedTouchEventReassembler: Sendable {
+    package static let maximumChunkCount = 512
+    package static let maximumInFlightEventCount = 64
+    package static let maximumBufferedBytes = 1024 * 1024
+    package static let maximumTerminalEventCount = 1024
+    package static let assemblyTimeoutNanoseconds: UInt64 = 5_000_000_000
+    package static let tombstoneLifetimeNanoseconds: UInt64 = 5_000_000_000
+
+    private struct Header: Equatable, Sendable {
+        let eventVersion: Int
+        let udid: String
+        let eventID: UUID
+        let dispatchUptimeNanoseconds: UInt64
+        let chunkCount: Int
+
+        init(_ datagram: RecordedTouchEventDatagram) {
+            eventVersion = datagram.event.version
+            udid = datagram.event.udid
+            eventID = datagram.event.eventID
+            dispatchUptimeNanoseconds = datagram.event.dispatchUptimeNanoseconds
+            chunkCount = datagram.chunkCount
+        }
+    }
+
+    private struct Assembly: Sendable {
+        let header: Header
+        let template: RecordedTouchEvent
+        let firstReceiptUptimeNanoseconds: UInt64
+        var chunks: [Int: [RecordedTouchSample]]
+        var bufferedBytes: Int
+    }
+
+    private var assemblies: [UUID: Assembly] = [:]
+    private var terminalEventDeadlines: [UUID: UInt64] = [:]
+    private var terminalEventOrder: [UUID] = []
+    private var terminalEventOrderHead = 0
+    private var totalBufferedBytes = 0
+
+    package init() {}
+
+    package mutating func accept(
+        _ datagram: RecordedTouchEventDatagram,
+        encodedBytes: Int,
+        expectedUDID: String,
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> RecordedTouchReassemblyOutput {
+        var diagnostics = expire(nowNanoseconds: nowNanoseconds)
+
+        guard datagram.version == RecordedTouchEventDatagram.currentVersion else {
+            diagnostics.append(.init(
+                kind: .versionMismatch,
+                message: "Got datagram version \(datagram.version), expected \(RecordedTouchEventDatagram.currentVersion)."
+            ))
+            return .init(diagnostics: diagnostics)
+        }
+        guard datagram.chunkCount > 0,
+              datagram.chunkCount <= Self.maximumChunkCount,
+              datagram.chunkIndex >= 0,
+              datagram.chunkIndex < datagram.chunkCount,
+              datagram.chunkCount == 1 || !datagram.event.samples.isEmpty else {
+            tombstone(datagram.event.eventID, nowNanoseconds: nowNanoseconds)
+            diagnostics.append(.init(
+                kind: .invalidChunkMetadata,
+                message: "Invalid chunk \(datagram.chunkIndex) of \(datagram.chunkCount) for event \(datagram.event.eventID)."
+            ))
+            return .init(diagnostics: diagnostics)
+        }
+        if let diagnostic = RecordedTouchEventValidator.validate(
+            datagram.event,
+            expectedUDID: expectedUDID
+        ) {
+            tombstone(datagram.event.eventID, nowNanoseconds: nowNanoseconds)
+            diagnostics.append(diagnostic)
+            return .init(diagnostics: diagnostics)
+        }
+
+        let eventID = datagram.event.eventID
+        guard terminalEventDeadlines[eventID] == nil else {
+            return .init(diagnostics: diagnostics)
+        }
+
+        if var assembly = assemblies[eventID] {
+            guard assembly.header == Header(datagram) else {
+                discardAssembly(eventID)
+                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                diagnostics.append(.init(
+                    kind: .invalidChunkMetadata,
+                    message: "Chunk metadata changed while reassembling event \(eventID)."
+                ))
+                return .init(diagnostics: diagnostics)
+            }
+
+            if let existing = assembly.chunks[datagram.chunkIndex] {
+                guard existing != datagram.event.samples else {
+                    return .init(diagnostics: diagnostics)
+                }
+                discardAssembly(eventID)
+                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                diagnostics.append(.init(
+                    kind: .invalidChunkMetadata,
+                    message: "Chunk \(datagram.chunkIndex) changed while reassembling event \(eventID)."
+                ))
+                return .init(diagnostics: diagnostics)
+            }
+
+            guard totalBufferedBytes <= Self.maximumBufferedBytes - encodedBytes else {
+                discardAssembly(eventID)
+                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                diagnostics.append(Self.limitDiagnostic(eventID: eventID))
+                return .init(diagnostics: diagnostics)
+            }
+            assembly.chunks[datagram.chunkIndex] = datagram.event.samples
+            assembly.bufferedBytes += encodedBytes
+            assemblies[eventID] = assembly
+            totalBufferedBytes += encodedBytes
+        } else {
+            guard datagram.chunkCount > 1 else {
+                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                return .init(event: datagram.event, diagnostics: diagnostics)
+            }
+            guard assemblies.count < Self.maximumInFlightEventCount,
+                  encodedBytes <= Self.maximumBufferedBytes,
+                  totalBufferedBytes <= Self.maximumBufferedBytes - encodedBytes else {
+                tombstone(eventID, nowNanoseconds: nowNanoseconds)
+                diagnostics.append(Self.limitDiagnostic(eventID: eventID))
+                return .init(diagnostics: diagnostics)
+            }
+            assemblies[eventID] = Assembly(
+                header: Header(datagram),
+                template: datagram.event,
+                firstReceiptUptimeNanoseconds: nowNanoseconds,
+                chunks: [datagram.chunkIndex: datagram.event.samples],
+                bufferedBytes: encodedBytes
+            )
+            totalBufferedBytes += encodedBytes
+        }
+
+        guard let complete = assemblies[eventID],
+              complete.chunks.count == complete.header.chunkCount else {
+            return .init(diagnostics: diagnostics)
+        }
+
+        var samples: [RecordedTouchSample] = []
+        for index in 0..<complete.header.chunkCount {
+            guard let chunk = complete.chunks[index] else {
+                return .init(diagnostics: diagnostics)
+            }
+            samples.append(contentsOf: chunk)
+        }
+        let event = complete.template.withSamples(samples)
+        discardAssembly(eventID)
+        tombstone(eventID, nowNanoseconds: nowNanoseconds)
+        if let diagnostic = RecordedTouchEventValidator.validate(event, expectedUDID: expectedUDID) {
+            diagnostics.append(diagnostic)
+            return .init(diagnostics: diagnostics)
+        }
+        return .init(event: event, diagnostics: diagnostics)
+    }
+
+    package mutating func expire(
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> [RecordedTouchTransportDiagnostic] {
+        expireTerminalEvents(nowNanoseconds: nowNanoseconds)
+        let expiredIDs = assemblies.compactMap { eventID, assembly -> UUID? in
+            guard nowNanoseconds >= assembly.firstReceiptUptimeNanoseconds,
+                  nowNanoseconds - assembly.firstReceiptUptimeNanoseconds
+                    >= Self.assemblyTimeoutNanoseconds else { return nil }
+            return eventID
+        }
+        var diagnostics: [RecordedTouchTransportDiagnostic] = []
+        for eventID in expiredIDs {
+            discardAssembly(eventID)
+            tombstone(eventID, nowNanoseconds: nowNanoseconds)
+            diagnostics.append(.init(
+                kind: .incompleteEventDiscarded,
+                message: "Incomplete recorded-touch event \(eventID) expired before every chunk arrived."
+            ))
+        }
+        return diagnostics
+    }
+
+    package mutating func reset() {
+        assemblies.removeAll()
+        terminalEventDeadlines.removeAll()
+        terminalEventOrder.removeAll()
+        terminalEventOrderHead = 0
+        totalBufferedBytes = 0
+    }
+
+    package var retainedTerminalEventCount: Int {
+        terminalEventDeadlines.count
+    }
+
+    private mutating func discardAssembly(_ eventID: UUID) {
+        guard let removed = assemblies.removeValue(forKey: eventID) else { return }
+        totalBufferedBytes -= removed.bufferedBytes
+    }
+
+    private mutating func tombstone(_ eventID: UUID, nowNanoseconds: UInt64) {
+        guard terminalEventDeadlines[eventID] == nil else { return }
+        while terminalEventDeadlines.count >= Self.maximumTerminalEventCount {
+            evictFirstTerminalEvent()
+        }
+        let (deadline, overflow) = nowNanoseconds.addingReportingOverflow(
+            Self.tombstoneLifetimeNanoseconds
+        )
+        terminalEventDeadlines[eventID] = overflow ? .max : deadline
+        terminalEventOrder.append(eventID)
+    }
+
+    private mutating func expireTerminalEvents(nowNanoseconds: UInt64) {
+        while terminalEventOrderHead < terminalEventOrder.count {
+            let eventID = terminalEventOrder[terminalEventOrderHead]
+            guard let deadline = terminalEventDeadlines[eventID] else {
+                terminalEventOrderHead += 1
+                continue
+            }
+            guard deadline <= nowNanoseconds else { break }
+            terminalEventDeadlines.removeValue(forKey: eventID)
+            terminalEventOrderHead += 1
+        }
+        compactTerminalEventOrderIfNeeded()
+    }
+
+    private mutating func evictFirstTerminalEvent() {
+        while terminalEventOrderHead < terminalEventOrder.count {
+            let eventID = terminalEventOrder[terminalEventOrderHead]
+            terminalEventOrderHead += 1
+            if terminalEventDeadlines.removeValue(forKey: eventID) != nil {
+                break
+            }
+        }
+        compactTerminalEventOrderIfNeeded()
+    }
+
+    private mutating func compactTerminalEventOrderIfNeeded() {
+        guard terminalEventOrderHead >= Self.maximumTerminalEventCount,
+              terminalEventOrderHead * 2 >= terminalEventOrder.count else { return }
+        terminalEventOrder.removeFirst(terminalEventOrderHead)
+        terminalEventOrderHead = 0
+    }
+
+    private static func limitDiagnostic(eventID: UUID) -> RecordedTouchTransportDiagnostic {
+        .init(
+            kind: .reassemblyLimitExceeded,
+            message: "Recorded-touch event \(eventID) exceeded listener reassembly limits."
+        )
+    }
+}
+
 /// Best-effort publisher used by the HID dispatch path.
 ///
-/// Publishing performs one datagram send and never throws or retries. A missing
-/// listener is normal; all other failures are returned for diagnostic logging
-/// without changing the HID operation's result.
+/// Publishing sends one pre-encoded logical event as one or more datagrams and
+/// never throws or retries. A missing listener is normal; all other failures are
+/// returned for diagnostic logging without changing the HID operation's result.
 package struct RecordedTouchEventPublisher: Sendable {
     package let paths: RecordedTouchTransportPaths
 
@@ -103,6 +398,7 @@ package struct RecordedTouchEventPublisher: Sendable {
             payloads = try Self.encodedPayloads(for: event)
         } catch {
             let kind: RecordedTouchTransportDiagnostic.Kind = error is OversizedRecordedTouchSample
+                || error is TooManyRecordedTouchChunks
                 ? .datagramTooLarge
                 : .encodingFailed
             return .failed(.init(kind: kind, message: error.localizedDescription))
@@ -175,19 +471,35 @@ package struct RecordedTouchEventPublisher: Sendable {
     }
 
     /// macOS commonly caps local datagrams at 2048 bytes. Keep each JSON
-    /// payload below that limit and preserve the original event ID/timeline
-    /// across chunks; Unix datagrams from one socket retain send order.
+    /// envelope below that limit. The listener reassembles every chunk before
+    /// exposing the original event.
     private static func encodedPayloads(for event: RecordedTouchEvent) throws -> [Data] {
         let encoder = JSONEncoder()
-        let whole = try encoder.encode(event)
+        let whole = try encoder.encode(RecordedTouchEventDatagram(
+            event: event,
+            chunkIndex: 0,
+            chunkCount: 1
+        ))
         guard whole.count > RecordedTouchUnixDatagram.safePayloadBytes else {
             return [whole]
         }
 
-        var payloads: [Data] = []
+        guard !event.samples.isEmpty else {
+            throw OversizedRecordedTouchSample(
+                encodedBytes: whole.count,
+                limit: RecordedTouchUnixDatagram.safePayloadBytes
+            )
+        }
+
+        var sampleChunks: [[RecordedTouchSample]] = []
         var chunkSamples: [RecordedTouchSample] = []
+        let conservativeChunkCount = event.samples.count
         for sample in event.samples {
-            let candidate = event.withSamples(chunkSamples + [sample])
+            let candidate = RecordedTouchEventDatagram(
+                event: event.withSamples(chunkSamples + [sample]),
+                chunkIndex: conservativeChunkCount - 1,
+                chunkCount: conservativeChunkCount
+            )
             let candidatePayload = try encoder.encode(candidate)
             if candidatePayload.count <= RecordedTouchUnixDatagram.safePayloadBytes {
                 chunkSamples.append(sample)
@@ -200,10 +512,14 @@ package struct RecordedTouchEventPublisher: Sendable {
                     limit: RecordedTouchUnixDatagram.safePayloadBytes
                 )
             }
-            payloads.append(try encoder.encode(event.withSamples(chunkSamples)))
+            sampleChunks.append(chunkSamples)
             chunkSamples = [sample]
 
-            let singlePayload = try encoder.encode(event.withSamples(chunkSamples))
+            let singlePayload = try encoder.encode(RecordedTouchEventDatagram(
+                event: event.withSamples(chunkSamples),
+                chunkIndex: conservativeChunkCount - 1,
+                chunkCount: conservativeChunkCount
+            ))
             guard singlePayload.count <= RecordedTouchUnixDatagram.safePayloadBytes else {
                 throw OversizedRecordedTouchSample(
                     encodedBytes: singlePayload.count,
@@ -213,9 +529,29 @@ package struct RecordedTouchEventPublisher: Sendable {
         }
 
         if !chunkSamples.isEmpty {
-            payloads.append(try encoder.encode(event.withSamples(chunkSamples)))
+            sampleChunks.append(chunkSamples)
         }
-        return payloads
+        guard sampleChunks.count <= RecordedTouchEventReassembler.maximumChunkCount else {
+            throw TooManyRecordedTouchChunks(
+                chunkCount: sampleChunks.count,
+                limit: RecordedTouchEventReassembler.maximumChunkCount
+            )
+        }
+
+        return try sampleChunks.enumerated().map { index, samples in
+            let payload = try encoder.encode(RecordedTouchEventDatagram(
+                event: event.withSamples(samples),
+                chunkIndex: index,
+                chunkCount: sampleChunks.count
+            ))
+            guard payload.count <= RecordedTouchUnixDatagram.safePayloadBytes else {
+                throw OversizedRecordedTouchSample(
+                    encodedBytes: payload.count,
+                    limit: RecordedTouchUnixDatagram.safePayloadBytes
+                )
+            }
+            return payload
+        }
     }
 
     private static func syscallDiagnostic(
@@ -248,6 +584,15 @@ private struct OversizedRecordedTouchSample: Error, LocalizedError {
 
     var errorDescription: String? {
         "One recorded-touch sample encodes to \(encodedBytes) bytes, exceeding the safe local datagram limit of \(limit) bytes."
+    }
+}
+
+private struct TooManyRecordedTouchChunks: Error, LocalizedError {
+    let chunkCount: Int
+    let limit: Int
+
+    var errorDescription: String? {
+        "Recorded-touch event requires \(chunkCount) datagrams, exceeding the reassembly limit of \(limit)."
     }
 }
 
@@ -292,6 +637,7 @@ package final class RecordedTouchEventListener {
 
     private let state: IntakeState
     private let source: DispatchSourceRead
+    private let reassemblyTimer: DispatchSourceTimer
     private let intakeQueue: DispatchQueue
     private let intakeQueueKey = DispatchSpecificKey<UInt8>()
     private let closeCondition = NSCondition()
@@ -312,16 +658,26 @@ package final class RecordedTouchEventListener {
         let queue = DispatchQueue(label: "com.lycorp.sim-use.recorded-touch.\(udid)")
         queue.setSpecific(key: intakeQueueKey, value: 1)
         let source = DispatchSource.makeReadSource(fileDescriptor: state.socketFD, queue: queue)
+        let reassemblyTimer = DispatchSource.makeTimerSource(queue: queue)
 
         self.paths = paths
         self.state = state
         self.intakeQueue = queue
         self.source = source
+        self.reassemblyTimer = reassemblyTimer
 
         source.setEventHandler { [state] in
             state.drainDatagrams()
         }
+        reassemblyTimer.setEventHandler { [state] in
+            state.expireIncompleteEvents()
+        }
+        reassemblyTimer.schedule(
+            deadline: .now() + .seconds(1),
+            repeating: .seconds(1)
+        )
         source.activate()
+        reassemblyTimer.activate()
     }
 
     package func close() {
@@ -348,6 +704,7 @@ package final class RecordedTouchEventListener {
         }
 
         source.cancel()
+        reassemblyTimer.cancel()
         if DispatchQueue.getSpecific(key: intakeQueueKey) == nil {
             intakeQueue.sync {
                 state.closeResources()
@@ -374,10 +731,10 @@ package final class RecordedTouchEventListener {
 }
 
 // GCD invokes this reference from its private serial queue while `close()` may
-// be called by the listener owner. Every mutable resource field is protected by
-// `lock`; callbacks receive immutable Sendable values only. The synchronized
-// type therefore owns the full cross-thread access contract required by this
-// narrow `@unchecked Sendable` bridge to DispatchSource.
+// be called by the listener owner. The lock protects resource closure; the
+// reassembler is confined to the serial intake queue, including close-time
+// reset. Callbacks receive immutable Sendable values only. These boundaries own
+// the narrow `@unchecked Sendable` bridge to DispatchSource.
 private final class IntakeState: @unchecked Sendable {
     fileprivate let socketFD: Int32
 
@@ -389,6 +746,7 @@ private final class IntakeState: @unchecked Sendable {
     private let diagnosticHandler: RecordedTouchEventListener.DiagnosticHandler?
     private let lock = NSLock()
     private var resourcesClosed = false
+    private var reassembler = RecordedTouchEventReassembler()
 
     init(
         paths: RecordedTouchTransportPaths,
@@ -444,19 +802,36 @@ private final class IntakeState: @unchecked Sendable {
             }
 
             let data = Data(buffer.prefix(received))
-            let event: RecordedTouchEvent
+            let datagram: RecordedTouchEventDatagram
             do {
-                event = try JSONDecoder().decode(RecordedTouchEvent.self, from: data)
+                datagram = try JSONDecoder().decode(RecordedTouchEventDatagram.self, from: data)
             } catch {
                 emit(.init(kind: .malformedPayload, message: error.localizedDescription))
                 continue
             }
 
-            if let diagnostic = RecordedTouchEventValidator.validate(event, expectedUDID: paths.udid) {
+            let output = reassembler.accept(
+                datagram,
+                encodedBytes: received,
+                expectedUDID: paths.udid
+            )
+            for diagnostic in output.diagnostics {
                 emit(diagnostic)
-                continue
             }
-            eventHandler(event)
+            if let event = output.event {
+                eventHandler(event)
+            }
+        }
+    }
+
+    func expireIncompleteEvents() {
+        lock.lock()
+        let closed = resourcesClosed
+        lock.unlock()
+        guard !closed else { return }
+
+        for diagnostic in reassembler.expire() {
+            emit(diagnostic)
         }
     }
 
@@ -468,6 +843,8 @@ private final class IntakeState: @unchecked Sendable {
         }
         resourcesClosed = true
         lock.unlock()
+
+        reassembler.reset()
 
         RecordedTouchOwnership.removePathIfOwned(paths.socketURL, identity: socketIdentity)
         Darwin.close(socketFD)

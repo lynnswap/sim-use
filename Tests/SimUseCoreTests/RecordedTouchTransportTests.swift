@@ -73,18 +73,14 @@ final class RecordedTouchTransportTests: XCTestCase {
         let expectedSamples = samples
         XCTAssertGreaterThan(try JSONEncoder().encode(event).count, 2_048)
 
-        let receivedEvents = LockedBox<[RecordedTouchEvent]>([])
-        let receivedAllSamples = expectation(description: "listener received every chunk")
+        let receivedEvent = LockedBox<RecordedTouchEvent?>(nil)
+        let receivedCompleteEvent = expectation(description: "listener received one complete event")
         let listener = try RecordedTouchEventListener(
             udid: udid,
             baseDirectory: base,
             onEvent: { received in
-                receivedEvents.withValue { events in
-                    events.append(received)
-                    if events.reduce(0, { $0 + $1.samples.count }) == expectedSamples.count {
-                        receivedAllSamples.fulfill()
-                    }
-                }
+                receivedEvent.withValue { $0 = received }
+                receivedCompleteEvent.fulfill()
             },
             onDiagnostic: { diagnostic in
                 XCTFail("Unexpected diagnostic: \(diagnostic)")
@@ -96,12 +92,200 @@ final class RecordedTouchTransportTests: XCTestCase {
             RecordedTouchEventPublisher(udid: udid, baseDirectory: base).publish(event),
             .delivered
         )
-        wait(for: [receivedAllSamples], timeout: 2)
+        wait(for: [receivedCompleteEvent], timeout: 2)
+        XCTAssertEqual(receivedEvent.value, event)
+        XCTAssertEqual(receivedEvent.value?.samples, expectedSamples)
+    }
 
-        let delivered = receivedEvents.value
-        XCTAssertGreaterThan(delivered.count, 1)
-        XCTAssertTrue(delivered.allSatisfy { $0.eventID == event.eventID })
-        XCTAssertEqual(delivered.flatMap(\.samples), expectedSamples)
+    func testIncompleteChunkIsNeverPublishedAndDoesNotBlockAnotherEvent() throws {
+        let base = makeBaseDirectoryURL()
+        defer { removeTemporaryDirectory(base) }
+        let udid = "SIM-PARTIAL"
+        let partial = makeEvent(udid: udid)
+        let unrelated = makeEvent(udid: udid)
+        let unrelatedDelivered = expectation(description: "complete unrelated event delivered")
+
+        let listener = try RecordedTouchEventListener(
+            udid: udid,
+            baseDirectory: base,
+            onEvent: { event in
+                if event.eventID == partial.eventID {
+                    XCTFail("An incomplete event must never reach the listener callback")
+                }
+                if event.eventID == unrelated.eventID {
+                    unrelatedDelivered.fulfill()
+                }
+            }
+        )
+        defer { listener.close() }
+
+        let firstChunk = RecordedTouchEventDatagram(
+            event: copy(partial, samples: [partial.samples[0]]),
+            chunkIndex: 0,
+            chunkCount: 2
+        )
+        try sendRawDatagram(JSONEncoder().encode(firstChunk), to: listener.paths.socketURL.path)
+        XCTAssertEqual(
+            RecordedTouchEventPublisher(udid: udid, baseDirectory: base).publish(unrelated),
+            .delivered
+        )
+
+        wait(for: [unrelatedDelivered], timeout: 2)
+    }
+
+    func testReassemblerAcceptsOutOfOrderAndDuplicateChunksExactlyOnce() throws {
+        let udid = "SIM-REASSEMBLY"
+        let event = makeEvent(udid: udid)
+        let first = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[0]]),
+            chunkIndex: 0,
+            chunkCount: 2
+        )
+        let second = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[1]]),
+            chunkIndex: 1,
+            chunkCount: 2
+        )
+        var reassembler = RecordedTouchEventReassembler()
+
+        XCTAssertNil(reassembler.accept(
+            second,
+            encodedBytes: try JSONEncoder().encode(second).count,
+            expectedUDID: udid,
+            nowNanoseconds: 10
+        ).event)
+        XCTAssertNil(reassembler.accept(
+            second,
+            encodedBytes: try JSONEncoder().encode(second).count,
+            expectedUDID: udid,
+            nowNanoseconds: 11
+        ).event)
+        XCTAssertEqual(reassembler.accept(
+            first,
+            encodedBytes: try JSONEncoder().encode(first).count,
+            expectedUDID: udid,
+            nowNanoseconds: 12
+        ).event, event)
+        XCTAssertNil(reassembler.accept(
+            first,
+            encodedBytes: try JSONEncoder().encode(first).count,
+            expectedUDID: udid,
+            nowNanoseconds: 13
+        ).event)
+    }
+
+    func testConflictingChunkDiscardsAndTombstonesWholeEvent() throws {
+        let udid = "SIM-CONFLICT"
+        let event = makeEvent(udid: udid)
+        let first = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[0]]),
+            chunkIndex: 0,
+            chunkCount: 2
+        )
+        let conflicting = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[1]]),
+            chunkIndex: 0,
+            chunkCount: 2
+        )
+        let second = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[1]]),
+            chunkIndex: 1,
+            chunkCount: 2
+        )
+        var reassembler = RecordedTouchEventReassembler()
+
+        _ = reassembler.accept(first, encodedBytes: 100, expectedUDID: udid, nowNanoseconds: 10)
+        let rejected = reassembler.accept(
+            conflicting,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: 11
+        )
+        XCTAssertEqual(rejected.diagnostics.last?.kind, .invalidChunkMetadata)
+        XCTAssertNil(rejected.event)
+        XCTAssertNil(reassembler.accept(
+            second,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: 12
+        ).event)
+    }
+
+    func testIncompleteReassemblyExpiresAndCannotBeResurrected() {
+        let udid = "SIM-EXPIRED"
+        let event = makeEvent(udid: udid)
+        let first = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[0]]),
+            chunkIndex: 0,
+            chunkCount: 2
+        )
+        let second = RecordedTouchEventDatagram(
+            event: copy(event, samples: [event.samples[1]]),
+            chunkIndex: 1,
+            chunkCount: 2
+        )
+        var reassembler = RecordedTouchEventReassembler()
+
+        _ = reassembler.accept(first, encodedBytes: 100, expectedUDID: udid, nowNanoseconds: 0)
+        let diagnostics = reassembler.expire(
+            nowNanoseconds: RecordedTouchEventReassembler.assemblyTimeoutNanoseconds
+        )
+        XCTAssertEqual(diagnostics.map(\.kind), [.incompleteEventDiscarded])
+        XCTAssertNil(reassembler.accept(
+            second,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: RecordedTouchEventReassembler.assemblyTimeoutNanoseconds + 1
+        ).event)
+    }
+
+    func testInvalidChunkBoundsAreRejectedBeforeAllocation() {
+        let udid = "SIM-CHUNK-BOUNDS"
+        let event = makeEvent(udid: udid)
+        var reassembler = RecordedTouchEventReassembler()
+        let invalid = RecordedTouchEventDatagram(
+            event: event,
+            chunkIndex: 0,
+            chunkCount: RecordedTouchEventReassembler.maximumChunkCount + 1
+        )
+
+        let output = reassembler.accept(
+            invalid,
+            encodedBytes: 100,
+            expectedUDID: udid,
+            nowNanoseconds: 0
+        )
+        XCTAssertEqual(output.diagnostics.last?.kind, .invalidChunkMetadata)
+        XCTAssertNil(output.event)
+    }
+
+    func testTerminalEventCacheStaysBoundedDuringUniqueEventFlood() {
+        let udid = "SIM-TERMINAL-BOUND"
+        var reassembler = RecordedTouchEventReassembler()
+
+        for index in 0...RecordedTouchEventReassembler.maximumTerminalEventCount {
+            let event = RecordedTouchEvent(
+                udid: udid,
+                dispatchUptimeNanoseconds: UInt64(index),
+                samples: []
+            )
+            let datagram = RecordedTouchEventDatagram(
+                event: event,
+                chunkIndex: 0,
+                chunkCount: 1
+            )
+            XCTAssertEqual(reassembler.accept(
+                datagram,
+                encodedBytes: 100,
+                expectedUDID: udid,
+                nowNanoseconds: UInt64(index)
+            ).event, event)
+        }
+
+        XCTAssertEqual(
+            reassembler.retainedTerminalEventCount,
+            RecordedTouchEventReassembler.maximumTerminalEventCount
+        )
     }
 
     func testMissingListenerIsNormalNoOpAndCreatesNoFilesystemState() {
@@ -350,7 +534,11 @@ final class RecordedTouchTransportTests: XCTestCase {
 
         try sendRawDatagram(Data("{".utf8), to: listener.paths.socketURL.path)
         try sendRawDatagram(
-            JSONEncoder().encode(makeEvent(udid: "OTHER-UDID")),
+            JSONEncoder().encode(RecordedTouchEventDatagram(
+                event: makeEvent(udid: "OTHER-UDID"),
+                chunkIndex: 0,
+                chunkCount: 1
+            )),
             to: listener.paths.socketURL.path
         )
         let wrongVersion = RecordedTouchEvent(
@@ -359,7 +547,14 @@ final class RecordedTouchTransportTests: XCTestCase {
             dispatchUptimeNanoseconds: 1,
             samples: []
         )
-        try sendRawDatagram(JSONEncoder().encode(wrongVersion), to: listener.paths.socketURL.path)
+        try sendRawDatagram(
+            JSONEncoder().encode(RecordedTouchEventDatagram(
+                event: wrongVersion,
+                chunkIndex: 0,
+                chunkCount: 1
+            )),
+            to: listener.paths.socketURL.path
+        )
 
         wait(for: [diagnostics], timeout: 2)
         XCTAssertEqual(
@@ -427,6 +622,19 @@ final class RecordedTouchTransportTests: XCTestCase {
                     .init(contactID: 0, phase: .ended, x: 100, y: 200),
                 ]),
             ]
+        )
+    }
+
+    private func copy(
+        _ event: RecordedTouchEvent,
+        samples: [RecordedTouchSample]
+    ) -> RecordedTouchEvent {
+        RecordedTouchEvent(
+            version: event.version,
+            udid: event.udid,
+            eventID: event.eventID,
+            dispatchUptimeNanoseconds: event.dispatchUptimeNanoseconds,
+            samples: samples
         )
     }
 
