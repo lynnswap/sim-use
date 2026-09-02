@@ -3,6 +3,9 @@ import Testing
 import Foundation
 import Darwin
 import AVFoundation
+import CoreGraphics
+import CoreMedia
+import CoreVideo
 import ImageIO
 import SimUseCore
 @testable import iOSSimBackend
@@ -114,22 +117,68 @@ struct RecordVideoTests {
         #expect(result.stderr.contains("Press Ctrl+C"))
     }
 
-    @Test("Touch indicator recording accepts a daemon-routed tap and writes a valid MP4")
+    @Test("Touch indicator recording composites a daemon-routed tap at the dispatched point")
     func recordVideoWithTouchIndicators() async throws {
+        let udid = try TestHelpers.requireSimulatorUDID()
+        try await TestHelpers.launchPlaygroundApp(
+            to: "orientation-test",
+            simulatorUDID: udid
+        )
+        let screen = try await Self.currentScreen(udid: udid)
+        let touchPoint = CGPoint(
+            x: screen.width * 0.5,
+            y: screen.height * 0.72
+        )
+
+        let controlURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sim-use-touch-control-\(UUID().uuidString).mp4")
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("sim-use-touch-indicators-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: controlURL) }
+        let control = try await invokeRecordVideo(
+            duration: 1,
+            outputPath: controlURL.path
+        )
+        #expect(control.exitCode == 0, "control stderr: \(control.stderr)")
+        let controlEvidence = try await Self.touchIndicatorEvidence(
+            at: control.outputURL,
+            touchPoint: touchPoint,
+            screen: screen
+        )
+
         let result = try await invokeRecordVideo(
             duration: 2,
             outputPath: outputURL.path,
             touchIndicators: true,
-            touchColor: "orange",
-            interactionArguments: ["tap", "-x", "200", "-y", "400"]
+            touchColor: "pink",
+            interactionArguments: [
+                "tap",
+                "-x", "\(Int(touchPoint.x))",
+                "-y", "\(Int(touchPoint.y))",
+            ]
         )
         defer { try? FileManager.default.removeItem(at: result.outputURL) }
 
         #expect(result.exitCode == 0, "stderr: \(result.stderr)")
         #expect(result.fileSize > 10_000)
         #expect(await Self.validateMP4(at: result.outputURL) == .valid)
+
+        let evidence = try await Self.touchIndicatorEvidence(
+            at: result.outputURL,
+            touchPoint: touchPoint,
+            screen: screen
+        )
+        #expect(
+            evidence.peakExpectedDifference > max(
+                controlEvidence.peakExpectedDifference + 8,
+                evidence.peakControlDifference + 8
+            ),
+            "expected the largest frame change at the touch point; control=\(controlEvidence), touch=\(evidence)"
+        )
+        #expect(
+            evidence.finalExpectedDifference < evidence.peakExpectedDifference * 0.35,
+            "touch ring should disappear before the final frame: \(evidence)"
+        )
     }
 
     @Test("Record video uses provided directory without deleting its contents")
@@ -231,6 +280,184 @@ struct RecordVideoTests {
         #expect(magic == "GIF89a" || magic == "GIF87a", "not a GIF file (magic: \(magic))")
         let source = try #require(CGImageSourceCreateWithURL(url as CFURL, nil), "GIF not readable by ImageIO")
         return CGImageSourceGetCount(source)
+    }
+
+    private struct TouchIndicatorEvidence: CustomStringConvertible {
+        let frameCount: Int
+        let peakExpectedDifference: Double
+        let peakControlDifference: Double
+        let finalExpectedDifference: Double
+
+        var description: String {
+            "frames=\(frameCount), peakExpected=\(peakExpectedDifference), peakControl=\(peakControlDifference), finalExpected=\(finalExpectedDifference)"
+        }
+    }
+
+    private struct DescribeScreenEnvelope: Decodable {
+        struct Payload: Decodable {
+            struct Screen: Decodable {
+                let width: Double
+                let height: Double
+            }
+
+            let screen: Screen
+        }
+
+        let data: Payload
+    }
+
+    private static func currentScreen(udid: String) async throws -> CGSize {
+        let result = try await TestHelpers.runSimUseCommand(
+            "describe-ui --json --no-raw",
+            simulatorUDID: udid
+        )
+        guard let jsonStart = result.output.firstIndex(of: "{") else {
+            throw TestError.invalidJSON("describe-ui returned no JSON object")
+        }
+        let data = Data(result.output[jsonStart...].utf8)
+        let envelope = try JSONDecoder().decode(DescribeScreenEnvelope.self, from: data)
+        guard envelope.data.screen.width > 0, envelope.data.screen.height > 0 else {
+            throw TestError.unexpectedState("describe-ui returned an empty screen")
+        }
+        return CGSize(
+            width: envelope.data.screen.width,
+            height: envelope.data.screen.height
+        )
+    }
+
+    private static func touchIndicatorEvidence(
+        at url: URL,
+        touchPoint: CGPoint,
+        screen: CGSize
+    ) async throws -> TouchIndicatorEvidence {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first else {
+            throw TestError.unexpectedState("recording has no video track")
+        }
+
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ])
+        output.alwaysCopiesSampleData = false
+        reader.add(output)
+        guard reader.startReading() else {
+            throw reader.error ?? TestError.unexpectedState("video reader did not start")
+        }
+
+        let controlPoint = CGPoint(
+            x: screen.width * 0.15,
+            y: touchPoint.y
+        )
+        var baselineExpected: [UInt8]?
+        var baselineControl: [UInt8]?
+        var peakExpectedDifference = 0.0
+        var peakControlDifference = 0.0
+        var finalExpectedDifference = 0.0
+        var frameCount = 0
+
+        while let sample = output.copyNextSampleBuffer(),
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
+            let expected = try pixelRegion(
+                in: pixelBuffer,
+                point: touchPoint,
+                screen: screen
+            )
+            let control = try pixelRegion(
+                in: pixelBuffer,
+                point: controlPoint,
+                screen: screen
+            )
+            frameCount += 1
+
+            guard let expectedBaseline = baselineExpected,
+                  let controlBaseline = baselineControl else {
+                baselineExpected = expected
+                baselineControl = control
+                continue
+            }
+
+            let expectedDifference = meanRGBDifference(
+                expected,
+                from: expectedBaseline
+            )
+            let controlDifference = meanRGBDifference(
+                control,
+                from: controlBaseline
+            )
+            peakExpectedDifference = max(peakExpectedDifference, expectedDifference)
+            peakControlDifference = max(peakControlDifference, controlDifference)
+            finalExpectedDifference = expectedDifference
+        }
+
+        if reader.status == .failed {
+            throw reader.error ?? TestError.unexpectedState("video reader failed")
+        }
+        guard frameCount >= 3, baselineExpected != nil else {
+            throw TestError.unexpectedState(
+                "recording produced only \(frameCount) decodable frames"
+            )
+        }
+        return TouchIndicatorEvidence(
+            frameCount: frameCount,
+            peakExpectedDifference: peakExpectedDifference,
+            peakControlDifference: peakControlDifference,
+            finalExpectedDifference: finalExpectedDifference
+        )
+    }
+
+    private static func pixelRegion(
+        in pixelBuffer: CVPixelBuffer,
+        point: CGPoint,
+        screen: CGSize
+    ) throws -> [UInt8] {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+            throw TestError.unexpectedState("video reader did not produce BGRA frames")
+        }
+        let scale = Double(CVPixelBufferGetWidth(pixelBuffer)) / screen.width
+        let centerX = Int((Double(point.x) * scale).rounded())
+        let centerY = Int((Double(point.y) * scale).rounded())
+        let radius = max(2, Int((26 * scale).rounded(.up)))
+        let minX = max(0, centerX - radius)
+        let maxX = min(CVPixelBufferGetWidth(pixelBuffer) - 1, centerX + radius)
+        let minY = max(0, centerY - radius)
+        let maxY = min(CVPixelBufferGetHeight(pixelBuffer) - 1, centerY + radius)
+
+        let status = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        guard status == kCVReturnSuccess,
+              let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw TestError.unexpectedState("could not read decoded video pixels")
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let base = baseAddress.assumingMemoryBound(to: UInt8.self)
+        var rgb: [UInt8] = []
+        rgb.reserveCapacity((maxX - minX + 1) * (maxY - minY + 1) * 3)
+        for y in minY...maxY {
+            let row = base.advanced(by: y * bytesPerRow)
+            for x in minX...maxX {
+                let pixel = row.advanced(by: x * 4)
+                rgb.append(pixel[0])
+                rgb.append(pixel[1])
+                rgb.append(pixel[2])
+            }
+        }
+        return rgb
+    }
+
+    private static func meanRGBDifference(
+        _ pixels: [UInt8],
+        from baseline: [UInt8]
+    ) -> Double {
+        guard pixels.count == baseline.count, !pixels.isEmpty else {
+            return .infinity
+        }
+        let total = zip(pixels, baseline).reduce(0) { partial, pair in
+            partial + abs(Int(pair.0) - Int(pair.1))
+        }
+        return Double(total) / Double(pixels.count)
     }
 
     private struct RecordingResult {
