@@ -86,6 +86,8 @@ public struct HIDInteractor {
         // Xcode 27 removed SimulatorKit; surface an actionable message
         // (select Xcode 26.x) before the loader fails cryptically.
         try XcodeCompatibility.assertSimulatorKitAvailable(logger: logger)
+        // Keep this explicit preload while the pinned idb constructs its
+        // Indigo client before loading SimulatorKit (facebook/idb#941).
         do {
             try frameworkLoader.loadPrivateFrameworks(logger)
             logger.info().log("Private frameworks loaded successfully.")
