@@ -73,7 +73,7 @@ private final class PublisherState: @unchecked Sendable {
         case closed(RecordedTouchStreamPublisherCloseReason)
     }
 
-    private let publisherID: UUID
+    private var publisherID: UUID
     private let socketPath: String
     private let queueCapacity: Int
     private let connector: RecordedTouchStreamConnector
@@ -188,6 +188,13 @@ private final class PublisherState: @unchecked Sendable {
     private func deliverOnIOQueue(
         _ batch: [RecordedTouchPrimitive]
     ) -> RecordedTouchStreamDeliveryResult {
+        deliverOnIOQueue(batch, reconnectingAfterPeerClose: false)
+    }
+
+    private func deliverOnIOQueue(
+        _ batch: [RecordedTouchPrimitive],
+        reconnectingAfterPeerClose: Bool
+    ) -> RecordedTouchStreamDeliveryResult {
         switch connectIfNeededOnIOQueue() {
         case .delivered: break
         case .noListener: return .noListener
@@ -201,6 +208,14 @@ private final class PublisherState: @unchecked Sendable {
                 let frame = try RecordedTouchStreamWire.encode(.update(primitive))
                 let write = DaemonSocket.writeAll(fd: socketFD, data: frame)
                 guard write.ok else {
+                    if !reconnectingAfterPeerClose,
+                       Self.isPeerClosure(write.lastErrno) {
+                        replaceConnectionIdentityOnIOQueue()
+                        return deliverOnIOQueue(
+                            batch,
+                            reconnectingAfterPeerClose: true
+                        )
+                    }
                     return failOnIOQueue(.writeFailed(errorNumber: write.lastErrno))
                 }
             }
@@ -269,6 +284,18 @@ private final class PublisherState: @unchecked Sendable {
         .closed(terminateOnIOQueue(reason))
     }
 
+    /// A stream connection is the contact-lifetime owner. When its peer has
+    /// closed, a replacement connection must use a fresh identity so the old
+    /// listener's EOF cannot cancel contacts delivered to a newer recording.
+    private func replaceConnectionIdentityOnIOQueue() {
+        dispatchPrecondition(condition: .onQueue(ioQueue))
+        if let socketFD {
+            Darwin.close(socketFD)
+            self.socketFD = nil
+        }
+        publisherID = UUID()
+    }
+
     private func terminateOnIOQueue(
         _ reason: RecordedTouchStreamPublisherCloseReason
     ) -> RecordedTouchStreamPublisherCloseReason {
@@ -293,6 +320,12 @@ private final class PublisherState: @unchecked Sendable {
 
     private static func configureConnectedSocket(_ fd: Int32) -> Bool {
         RecordedTouchStreamSocket.configurePublisherFD(fd)
+    }
+
+    private static func isPeerClosure(_ errorNumber: Int32) -> Bool {
+        errorNumber == EPIPE
+            || errorNumber == ECONNRESET
+            || errorNumber == ENOTCONN
     }
 
     private enum Batch {

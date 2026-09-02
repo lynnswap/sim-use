@@ -207,8 +207,8 @@ struct RecordedTouchStreamBridgeTests {
         _ = publisher.close()
     }
 
-    @Test("Write failure terminates the connected publisher session")
-    func writeFailureClosesPublisher() throws {
+    @Test("Stale peer closure without a replacement listener is a retryable no-op")
+    func stalePeerWithoutReplacementIsNoListener() throws {
         let fixture = try Fixture(udid: "WRITE-FAILURE")
         defer { fixture.remove() }
         let inputs = InputCollector()
@@ -221,16 +221,46 @@ struct RecordedTouchStreamBridgeTests {
         listener.close()
 
         #expect(publisher.enqueue(try primitive(timestamp: 2)) == .enqueued)
-        let failure = publisher.flush()
-        guard case .closed(let terminalReason) = failure,
-              case .writeFailed = terminalReason else {
-            Issue.record("Expected write failure after the listener closed; got \(failure)")
+        #expect(publisher.flush() == .noListener)
+        #expect(publisher.enqueue(try primitive(timestamp: 3)) == .enqueued)
+        #expect(publisher.flush() == .noListener)
+        #expect(publisher.close() == .explicit)
+    }
+
+    @Test("First touch reconnects to a consecutive recording after stale peer closure")
+    func reconnectsAcrossConsecutiveListeners() throws {
+        let fixture = try Fixture(udid: "CONSECUTIVE")
+        defer { fixture.remove() }
+        let firstInputs = InputCollector()
+        let initialPublisherID = UUID()
+        let firstListener = try fixture.listener { input in
+            firstInputs.append(input)
+        }
+        let publisher = fixture.publisher(publisherID: initialPublisherID)
+
+        #expect(publisher.enqueue(try primitive(timestamp: 1)) == .enqueued)
+        #expect(publisher.flush() == .delivered)
+        #expect(firstInputs.waitForCount(1))
+        firstListener.close()
+
+        let secondInputs = InputCollector()
+        let secondListener = try fixture.listener { input in
+            secondInputs.append(input)
+        }
+        defer { secondListener.close() }
+
+        #expect(publisher.enqueue(try primitive(timestamp: 2)) == .enqueued)
+        #expect(secondInputs.waitForCount(1))
+        #expect(publisher.flush() == .delivered)
+
+        guard case let .update(replacementPublisherID, primitive) = secondInputs.values[0]
+        else {
+            Issue.record("Expected the second listener to receive the replacement update")
             return
         }
-        #expect(publisher.enqueue(try primitive(timestamp: 3)) == .closed(
-            terminalReason
-        ))
-        #expect(publisher.close() == terminalReason)
+        #expect(replacementPublisherID != initialPublisherID)
+        #expect(primitive.dispatchUptimeNanoseconds == 2)
+        _ = publisher.close()
     }
 
     @Test("Listener exclusively owns and removes its endpoint")
