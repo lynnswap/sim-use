@@ -116,6 +116,7 @@ struct HIDPerformRecoveryRecoverTests {
         var calls: [String] = []
         try await HIDPerformRecovery.recover(
             from: MessageError("Mach port invalid, device disconnected"),
+            wholeEventRetryIsSafe: true,
             invalidate: { calls.append("invalidate") },
             rebuildAndRetry: { calls.append("retry") }
         )
@@ -131,6 +132,7 @@ struct HIDPerformRecoveryRecoverTests {
         await #expect {
             try await HIDPerformRecovery.recover(
                 from: original,
+                wholeEventRetryIsSafe: true,
                 invalidate: { calls.append("invalidate") },
                 rebuildAndRetry: { calls.append("retry") }
             )
@@ -151,6 +153,7 @@ struct HIDPerformRecoveryRecoverTests {
         await #expect {
             try await HIDPerformRecovery.recover(
                 from: MessageError("Mach port invalid, device disconnected"),
+                wholeEventRetryIsSafe: true,
                 invalidate: { calls.append("invalidate") },
                 rebuildAndRetry: {
                     calls.append("retry")
@@ -161,5 +164,19 @@ struct HIDPerformRecoveryRecoverTests {
             error.localizedDescription.contains("is not booted. Current state")
         }
         #expect(calls == ["invalidate", "retry"])
+    }
+
+    @Test("An acknowledged touch makes whole-event retry unsafe")
+    func acknowledgedTouchPreventsRetry() async {
+        var calls: [String] = []
+        await #expect(throws: MessageError.self) {
+            try await HIDPerformRecovery.recover(
+                from: MessageError("Mach port invalid, device disconnected"),
+                wholeEventRetryIsSafe: false,
+                invalidate: { calls.append("invalidate") },
+                rebuildAndRetry: { calls.append("retry") }
+            )
+        }
+        #expect(calls == ["invalidate"])
     }
 }

@@ -56,7 +56,7 @@ E2E suites compile always but skip unless `SIM_USE_E2E=1` (iOS) / `SIM_USE_E2E_A
 
 `make e2e-matrix` validates the host-environment matrix: Xcode 26.x / 27.x × Device Hub closed at boot (`*-sim` legs — the Simulator.app workflow, legacy HID) or open at boot (`*-hub` legs — CoreDevice dtuhidd HID). One leg runs the full suite (default `x27-hub`; `ARGS="--full <leg>|all|none"`), the rest run the smoke tier (`scripts/test-runner.sh --smoke`: describe-ui, tap, type, scroll); legs whose Xcode is missing are skipped. The package builds once on the xcode-select toolchain — each leg only swaps the runtime Xcode via `SIM_USE_TEST_DEVELOPER_DIR` and boots a device matching its iOS generation, with dtuhidd/transport gates before and after the suites so a choreography failure cannot green-run the wrong combination. It quits Device Hub and shuts down every booted simulator, so never run it alongside other simulator work. Per-leg logs + evidence: `.build/e2e-matrix/<timestamp>/`.
 
-Agent-facing behaviour (the bundled skill) has its own natural-language eval layer — see `e2e/agent-evals/README.md` and `docs/ai/xxxx-e2e-confidence-suite/`.
+Agent-facing behaviour (the bundled skill) has its own natural-language eval layer — see `e2e/agent-evals/README.md`.
 
 ### Verifying a change
 
@@ -95,6 +95,7 @@ Four verbs are iOS-only (`key`, `key-combo`, `key-sequence`, `batch`) — no top
 - **Cross-platform**: write `IOSSim<Verb>Command` + `Android<Verb>Command`, plus a top-level forwarder in `Sources/SimUse/Commands/<Verb>.swift`. Register in `IOSSimCommand.swift`, `AndroidCommand.swift`, and `main.swift`.
 - **iOS-only**: write `IOSSim<Verb>Command`, register in `IOSSimCommand` only. Use `HIDKeyCommandHelp.androidUnsupportedMessage` to reject Android UDIDs (see `IOSSimKeyCommand`).
 - **Shared flags**: `@OptionGroup var udid: UDIDOptions` + `@OptionGroup var json: JSONOutputOptions`.
+- **Coverage**: update the platform E2E suite, its Playground fixture surface, and every explicit suite list in the corresponding test runner.
 
 ### Daemon
 

@@ -125,6 +125,8 @@ sim-use screenshot --output shot.png
 sim-use record-video --output recording.mp4             # H.264, 30 fps default; Ctrl+C to stop
 sim-use record-video --output smooth.mp4 --fps 60       # iOS: constant rate up to 60 fps (Android ignores --fps, native rate)
 sim-use record-video --output demo.gif                  # animated GIF (inferred from extension, or --format gif); 10 fps + 0.5 scale defaults; add --gif-markers for START/END boundary cards; transcoded after Ctrl+C
+sim-use record-video --output demo.mp4 --touch-indicators  # iOS Simulator: show sim-use-issued touches; semantic blue by default
+sim-use record-video --output demo.mp4 --touch-indicators --touch-color orange  # choose another semantic system color
 sim-use stream-video --fps 10 --format mjpeg > out.mjpeg  # live JPEG stream (both platforms)
 sim-use stream-video --format h264 | ffplay -f h264 -      # Android only: native H.264 passthrough (VFR)
 ```

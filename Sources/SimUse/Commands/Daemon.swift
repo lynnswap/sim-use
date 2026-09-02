@@ -56,7 +56,10 @@ struct Daemon: AsyncParsableCommand {
             // never raise `staleSimulator` so this hook is a no-op for
             // them — it's still installed to keep the code path uniform.
             DaemonDispatch.platformStaleCleanup = { udid in
-                HIDInteractor.clearHIDConnection(for: udid)
+                HIDInteractor.clearHIDConnection(
+                    for: udid,
+                    resetRecordedTouchPublisher: true
+                )
             }
             // Wire the platform-appropriate live-app probe so the daemon
             // can detect a target process disappearing between commands

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `record-video --touch-indicators` adds ShowTime-inspired touch rings to iOS Simulator recordings for input issued through sim-use, including multi-touch and batched HID gestures. The opt-in keeps ordinary recordings as faithful captures, uses semantic system blue by default, and accepts another semantic palette color through `--touch-color`; Android rejects the opt-in until its capture path supports the same behavior.
+
 ## [0.14.0] - 2026-08-27
 
 ### Added

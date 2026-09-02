@@ -9,7 +9,13 @@ public enum VideoRecordingOptions {
     /// `scale` is optional because its default is format-dependent
     /// (1.0 for mp4, 0.5 for gif — see `ResolvedRecordingOptions`);
     /// nil means "not user-supplied" and needs no range check.
-    public static func validate(fps: Int?, quality: Int, scale: Double?) throws {
+    public static func validate(
+        fps: Int?,
+        quality: Int,
+        scale: Double?,
+        touchIndicators: Bool,
+        touchColor: TouchIndicatorColor?
+    ) throws {
         if let fps {
             guard fps >= 1 && fps <= 60 else {
                 throw ValidationError("FPS must be between 1 and 60")
@@ -21,6 +27,10 @@ public enum VideoRecordingOptions {
         guard scale.map({ $0 >= 0.1 && $0 <= 1.0 }) ?? true else {
             throw ValidationError("Scale must be between 0.1 and 1.0")
         }
+        _ = try TouchIndicatorConfiguration(
+            enabled: touchIndicators,
+            color: touchColor
+        )
     }
 
     /// The `stream-video` variant: streaming caps FPS at 30 (screenshot/

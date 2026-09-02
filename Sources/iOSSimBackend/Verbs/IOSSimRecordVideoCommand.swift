@@ -36,6 +36,14 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
         let underlying: String
     }
 
+    private struct TouchIndicatorRecordingUnavailableError: Error, LocalizedError {
+        let underlying: String
+
+        var errorDescription: String? {
+            "Touch indicators could not be enabled for this recording: \(underlying) Omit --touch-indicators to use the ordinary recording path."
+        }
+    }
+
     @OptionGroup public var device: DeviceOptions
 
     @Option(help: "Frames per second (1-60; default: 30 for mp4, 10 for gif).")
@@ -52,6 +60,12 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
 
     @Flag(help: "Bracket a GIF with START/END marker frames (opt-in; ignored for mp4).")
     public var gifMarkers: Bool = false
+
+    @Flag(help: "Overlay indicators for touch input issued through sim-use (opt-in).")
+    public var touchIndicators: Bool = false
+
+    @Option(help: "Semantic color for --touch-indicators: blue, red, orange, yellow, green, mint, teal, cyan, indigo, purple, pink, brown, gray (default: blue).")
+    public var touchColor: TouchIndicatorColor?
 
     @Option(help: "Output file path. Defaults to sim-use-video-<timestamp>.<format> in the current directory.")
     public var output: String?
@@ -78,7 +92,13 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
     }
 
     public func validate() throws {
-        try VideoRecordingOptions.validate(fps: fps, quality: quality, scale: scale)
+        try VideoRecordingOptions.validate(
+            fps: fps,
+            quality: quality,
+            scale: scale,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
+        )
     }
 
     public func execute() async throws -> ExecutionResult {
@@ -103,7 +123,15 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
 
         // GIF is transcoded from a finished MP4 (see GIFTranscoder); the
         // capture loop itself always writes H.264, to plan.recordTarget.
-        let plan = try RecordingOutputPlan(format: format, output: output, fps: fps, scale: scale, gifMarkers: gifMarkers)
+        let plan = try RecordingOutputPlan(
+            format: format,
+            output: output,
+            fps: fps,
+            scale: scale,
+            gifMarkers: gifMarkers,
+            touchIndicators: touchIndicators,
+            touchColor: touchColor
+        )
         let options = plan.options
         let recordTarget = plan.recordTarget
         FileHandle.standardError.write(Data("Recording simulator \(targetSimulator.udid) to \(plan.outputURL.path)\n".utf8))
@@ -118,14 +146,28 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
         defer { signalObserver.invalidate() }
 
         do {
-            try await recordVideoViaNativeRecording(
-                simulator: targetSimulator,
-                outputURL: recordTarget,
-                fps: options.fps ?? 30,
-                quality: quality,
-                scale: options.scale,
-                cancellationFlag: cancellationFlag
-            )
+            switch options.touchIndicators {
+            case .disabled:
+                try await recordVideoViaNativeRecording(
+                    simulator: targetSimulator,
+                    outputURL: recordTarget,
+                    fps: options.fps ?? 30,
+                    quality: quality,
+                    scale: options.scale,
+                    cancellationFlag: cancellationFlag
+                )
+            case let .enabled(color):
+                try await recordVideoViaNativeRecordingWithTouchIndicators(
+                    simulator: targetSimulator,
+                    outputURL: recordTarget,
+                    fps: options.fps ?? 30,
+                    quality: quality,
+                    scale: options.scale,
+                    color: color,
+                    cancellationFlag: cancellationFlag,
+                    logger: logger
+                )
+            }
             recordingFinished.cancel()
         } catch let unavailable as RecordingUnavailableError {
             FileHandle.standardError.write(Data("warning: native H.264 recording unavailable (\(unavailable.underlying)); falling back to screenshot capture\n".utf8))
@@ -167,126 +209,24 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
         scale: Double,
         cancellationFlag: CancellationFlag
     ) async throws {
-        let config = FBVideoStreamConfiguration(
-            format: .compressedVideo(withCodec: .h264, transport: .annexB),
-            framesPerSecond: fps,
-            rateControl: .quality(Double(quality) / 100.0),
-            scaleFactor: scale,
-            keyFrameRate: 2.0
+        let config = videoStreamConfiguration(
+            fps: fps,
+            quality: quality,
+            scale: scale
         )
 
-        let framebuffer: FBFramebuffer
+        let recording: any FBVideoRecording
         do {
-            framebuffer = try await simulator.connectToFramebuffer()
+            recording = try await simulator.startRecording(toFile: outputURL.path, configuration: config)
         } catch {
             throw RecordingUnavailableError(underlying: error.localizedDescription)
         }
-
-        let recording = FBSimulatorVideo.video(
-            withFramebuffer: framebuffer,
-            configuration: config,
-            filePath: outputURL.path,
-            logger: SimUseLogger()
-        )
-
-        guard let screenInfo = simulator.screenInfo,
-              screenInfo.widthPixels > 0,
-              screenInfo.heightPixels > 0,
-              screenInfo.scale > 0
-        else {
-            throw RecordingUnavailableError(underlying: "Simulator screen info is unavailable")
-        }
-
-        let transform = FBOverlayCoordinateTransform(
-            screenPixelWidth: Int(screenInfo.widthPixels),
-            screenPixelHeight: Int(screenInfo.heightPixels),
-            retinaScale: CGFloat(screenInfo.scale),
-            videoScale: CGFloat(scale),
-            borderTop: 0,
-            scaledBorderTop: 0,
-            borderBottom: 0,
-            scaledBorderBottom: 0,
-            coordSpace: .device
-        )
-        let renderer = FBOverlayRenderer(transform: transform)
-        recording.stream.updateOverlayBuffer(renderer.buffer)
-
-        do {
-            try await recording.startRecording()
-        } catch {
-            throw RecordingUnavailableError(underlying: error.localizedDescription)
-        }
-
-        let eventPath = ProcessInfo.processInfo.environment["SIM_USE_TOUCH_OVERLAY_PROBE_EVENT_FILE"]
-        var lastEventPayload: String?
 
         while !(Task.isCancelled || cancellationFlag.isCancelled()) {
-            if let eventPath,
-               let payload = try? String(contentsOfFile: eventPath, encoding: .utf8),
-               payload != lastEventPayload
-            {
-                lastEventPayload = payload
-                let fields = payload.split(separator: "|", omittingEmptySubsequences: false)
-
-                if fields.count == 4,
-                   fields[0] == "tap",
-                   let x = Double(fields[2]),
-                   let y = Double(fields[3])
-                {
-                    let fade = FBOverlayShape.Effect.fadeout(.init(durationMs: 900))
-                    renderer.render(overlays: [
-                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 22, rgba: [53.55, 155.55, 234.6, 1], effect: fade)),
-                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 19, rgba: [53.55, 155.55, 234.6, 0.5], effect: fade)),
-                    ])
-                    recording.stream.updateOverlayBuffer(renderer.buffer)
-                    renderer.startEffectTimer {
-                        recording.stream.updateOverlayBuffer(renderer.buffer)
-                    }
-                } else if fields.count == 7,
-                          fields[0] == "swipe",
-                          let startX = Double(fields[2]),
-                          let startY = Double(fields[3]),
-                          let endX = Double(fields[4]),
-                          let endY = Double(fields[5]),
-                          let duration = Double(fields[6])
-                {
-                    let translate = FBOverlayShape.Effect.translate(.init(
-                        x: CGFloat(endX),
-                        y: CGFloat(endY),
-                        durationMs: CGFloat(duration * 1_000)
-                    ))
-                    renderer.render(overlays: [
-                        .circle(.init(x: CGFloat(startX), y: CGFloat(startY), radius: 22, rgba: [53.55, 155.55, 234.6, 1], effect: translate)),
-                        .circle(.init(x: CGFloat(startX), y: CGFloat(startY), radius: 19, rgba: [53.55, 155.55, 234.6, 0.5], effect: translate)),
-                    ])
-                    recording.stream.updateOverlayBuffer(renderer.buffer)
-                    renderer.startEffectTimer {
-                        recording.stream.updateOverlayBuffer(renderer.buffer)
-                    }
-                } else if fields.count == 4,
-                          fields[0] == "swipeEnd",
-                          let x = Double(fields[2]),
-                          let y = Double(fields[3])
-                {
-                    renderer.clear()
-                    let fade = FBOverlayShape.Effect.fadeout(.init(durationMs: 650))
-                    renderer.render(overlays: [
-                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 22, rgba: [53.55, 155.55, 234.6, 1], effect: fade)),
-                        .circle(.init(x: CGFloat(x), y: CGFloat(y), radius: 19, rgba: [53.55, 155.55, 234.6, 0.5], effect: fade)),
-                    ])
-                    recording.stream.updateOverlayBuffer(renderer.buffer)
-                    renderer.startEffectTimer {
-                        recording.stream.updateOverlayBuffer(renderer.buffer)
-                    }
-                }
-            }
-
-            try? await cancellableSleep(seconds: 1.0 / 60.0, flag: cancellationFlag)
+            try? await cancellableSleep(seconds: 0.1, flag: cancellationFlag)
         }
 
         do {
-            renderer.clear()
-            recording.stream.updateOverlayBuffer(renderer.buffer)
             _ = try await recording.stop()
         } catch {
             // Whether a usable file survived a mid-recording failure is not
@@ -299,6 +239,134 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
             }
             throw error
         }
+    }
+
+    private func recordVideoViaNativeRecordingWithTouchIndicators(
+        simulator: FBSimulator,
+        outputURL: URL,
+        fps: Int,
+        quality: Int,
+        scale: Double,
+        color: TouchIndicatorColor,
+        cancellationFlag: CancellationFlag,
+        logger: SimUseLogger
+    ) async throws {
+        guard let screenInfo = simulator.screenInfo else {
+            throw TouchIndicatorRecordingUnavailableError(
+                underlying: "Simulator screen information is unavailable."
+            )
+        }
+
+        let geometry: TouchIndicatorVideoGeometry
+        do {
+            geometry = try TouchIndicatorVideoGeometry(
+                screenPixelWidth: Int(screenInfo.widthPixels),
+                screenPixelHeight: Int(screenInfo.heightPixels),
+                screenScale: CGFloat(screenInfo.scale),
+                videoScale: scale
+            )
+        } catch {
+            throw TouchIndicatorRecordingUnavailableError(
+                underlying: error.localizedDescription
+            )
+        }
+
+        let framebuffer: FBFramebuffer
+        do {
+            framebuffer = try await simulator.connectToFramebuffer()
+        } catch {
+            throw TouchIndicatorRecordingUnavailableError(
+                underlying: "Could not connect to the Simulator framebuffer: \(error.localizedDescription)"
+            )
+        }
+
+        let recording = FBSimulatorVideo.video(
+            withFramebuffer: framebuffer,
+            configuration: videoStreamConfiguration(
+                fps: fps,
+                quality: quality,
+                scale: scale
+            ),
+            filePath: outputURL.path,
+            logger: logger
+        )
+
+        let overlaySession: RecordingTouchOverlaySession
+        do {
+            overlaySession = try RecordingTouchOverlaySession(
+                udid: simulator.udid,
+                stream: recording.stream,
+                geometry: geometry,
+                color: color,
+                framesPerSecond: fps
+            )
+        } catch {
+            throw TouchIndicatorRecordingUnavailableError(
+                underlying: error.localizedDescription
+            )
+        }
+
+        var recordingStarted = false
+        var primaryError: Error?
+        do {
+            try await recording.startRecording()
+            recordingStarted = true
+            overlaySession.activate()
+
+            while !(Task.isCancelled || cancellationFlag.isCancelled()) {
+                try overlaySession.checkHealth()
+                try? await cancellableSleep(seconds: 0.1, flag: cancellationFlag)
+            }
+            try overlaySession.checkHealth()
+        } catch {
+            primaryError = error
+        }
+
+        do {
+            try overlaySession.close()
+        } catch {
+            if primaryError == nil { primaryError = error }
+        }
+
+        if recordingStarted {
+            do {
+                _ = try await recording.stop()
+            } catch {
+                let stopError = recordingStopError(error, outputURL: outputURL)
+                if let primaryError {
+                    throw CLIError(errorDescription: "\(primaryError.localizedDescription) Additionally, \(stopError.localizedDescription)")
+                }
+                throw stopError
+            }
+        }
+
+        if let primaryError {
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                throw CLIError(errorDescription: "\(primaryError.localizedDescription); recording saved with incomplete touch indicators to \(outputURL.path)")
+            }
+            throw primaryError
+        }
+    }
+
+    private func videoStreamConfiguration(
+        fps: Int,
+        quality: Int,
+        scale: Double
+    ) -> FBVideoStreamConfiguration {
+        FBVideoStreamConfiguration(
+            format: .compressedVideo(withCodec: .h264, transport: .annexB),
+            framesPerSecond: fps,
+            rateControl: .quality(Double(quality) / 100.0),
+            scaleFactor: scale,
+            keyFrameRate: 2.0
+        )
+    }
+
+    private func recordingStopError(_ error: Error, outputURL: URL) -> Error {
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            return CLIError(errorDescription: "\(error.localizedDescription); partial recording saved to \(outputURL.path)")
+        }
+        return error
     }
 
     // MARK: - Screenshot fallback
