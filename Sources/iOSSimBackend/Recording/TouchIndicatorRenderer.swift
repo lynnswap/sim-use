@@ -13,8 +13,18 @@ import SimUseVideo
 /// lifecycle. The renderer keeps a completed generation separate from the
 /// active ID, so a subsequent contact may reuse the ID while the previous
 /// indicator is still fading.
+package struct TouchIndicatorContactID: Equatable, Hashable, Sendable {
+    package let publisherID: UUID
+    package let localID: UInt8
+
+    package init(publisherID: UUID, localID: UInt8) {
+        self.publisherID = publisherID
+        self.localID = localID
+    }
+}
+
 package struct TouchIndicatorContactUpdate: Equatable, Sendable {
-    package let contactID: UInt32
+    package let contactID: TouchIndicatorContactID
     package let phase: TouchIndicatorPhase
     package let position: CGPoint
     /// Absolute host monotonic time, in the same uptime epoch used by
@@ -22,7 +32,7 @@ package struct TouchIndicatorContactUpdate: Equatable, Sendable {
     package let uptimeNanoseconds: UInt64
 
     package init(
-        contactID: UInt32,
+        contactID: TouchIndicatorContactID,
         phase: TouchIndicatorPhase,
         position: CGPoint,
         uptimeNanoseconds: UInt64
@@ -122,7 +132,7 @@ package final class TouchIndicatorRenderer {
 
     /// The active generation for each wire contact ID. Completed generations
     /// remain in `timelines` until their independent fade finishes.
-    private var activeSequences: [UInt32: UInt64] = [:]
+    private var activeSequences: [TouchIndicatorContactID: UInt64] = [:]
     private var timelines: [UInt64: ContactTimeline] = [:]
     private var nextContactSequence: UInt64 = 0
 
@@ -205,6 +215,27 @@ package final class TouchIndicatorRenderer {
             case .ended, .cancelled:
                 end(update)
             }
+        }
+    }
+
+    /// Ends every active contact owned by one disconnected publisher. The
+    /// ordered stream connection is the publisher lifetime owner, so EOF is a
+    /// normal terminal input rather than a recovery condition.
+    package func cancelContacts(
+        from publisherID: UUID,
+        uptimeNanoseconds: UInt64
+    ) {
+        let contactIDs = activeSequences.keys.filter {
+            $0.publisherID == publisherID
+        }
+        for contactID in contactIDs {
+            guard let sequence = activeSequences[contactID],
+                  var timeline = timelines[sequence],
+                  uptimeNanoseconds >= timeline.generationStartedAtNanoseconds
+            else { continue }
+            activeSequences.removeValue(forKey: contactID)
+            timeline.endedAtNanoseconds = uptimeNanoseconds
+            timelines[sequence] = timeline
         }
     }
 

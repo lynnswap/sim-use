@@ -58,7 +58,7 @@ struct Daemon: AsyncParsableCommand {
             DaemonDispatch.platformStaleCleanup = { udid in
                 HIDInteractor.clearHIDConnection(
                     for: udid,
-                    resetRecordedTouchState: true
+                    resetRecordedTouchPublisher: true
                 )
             }
             // Wire the platform-appropriate live-app probe so the daemon

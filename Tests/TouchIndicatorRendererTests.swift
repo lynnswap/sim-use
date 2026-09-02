@@ -7,6 +7,10 @@ import Testing
 
 @Suite("Touch indicator renderer", .serialized)
 struct TouchIndicatorRendererTests {
+    private static let defaultPublisherID = UUID(
+        uuidString: "00000000-0000-0000-0000-000000000001"
+    )!
+
     private final class FakeClock {
         private(set) var currentNanoseconds: UInt64 = 0
 
@@ -86,13 +90,17 @@ struct TouchIndicatorRendererTests {
 
     private func update(
         _ phase: TouchIndicatorPhase,
-        id: UInt32 = 0,
+        id: UInt8 = 0,
+        publisherID: UUID = Self.defaultPublisherID,
         x: CGFloat,
         y: CGFloat,
         at uptimeNanoseconds: UInt64 = 0
     ) -> TouchIndicatorContactUpdate {
         TouchIndicatorContactUpdate(
-            contactID: id,
+            contactID: TouchIndicatorContactID(
+                publisherID: publisherID,
+                localID: id
+            ),
             phase: phase,
             position: CGPoint(x: x, y: y),
             uptimeNanoseconds: uptimeNanoseconds
@@ -321,6 +329,27 @@ struct TouchIndicatorRendererTests {
         #expect(pixels.pixel(x: 30, y: 64).alpha == 0)
         #expect(pixels.pixel(x: 145, y: 64).alpha > 0)
         #expect(!renderer.needsAnimationFrame)
+    }
+
+    @Test("Publisher close cancels only contacts owned by that publisher")
+    func publisherCloseScopesContactIdentity() throws {
+        let clock = FakeClock()
+        let renderer = try makeRenderer(width: 180, clock: clock)
+        let firstPublisher = UUID()
+        let secondPublisher = UUID()
+        renderer.apply([
+            update(.began, publisherID: firstPublisher, x: 35, y: 64),
+            update(.began, publisherID: secondPublisher, x: 145, y: 64),
+        ])
+        renderer.cancelContacts(
+            from: firstPublisher,
+            uptimeNanoseconds: clock.now()
+        )
+
+        clock.advance(milliseconds: 400)
+        let pixels = try snapshot(renderer.render())
+        #expect(pixels.pixel(x: 35, y: 64).alpha == 0)
+        #expect(pixels.pixel(x: 145, y: 64).alpha > 0)
     }
 
     @Test("A delayed terminal update cannot close a newer lifecycle for a reused contact ID")

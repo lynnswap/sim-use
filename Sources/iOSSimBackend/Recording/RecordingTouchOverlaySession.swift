@@ -14,7 +14,7 @@ import SimUseVideo
 final class RecordingTouchOverlaySession {
     private let stream: FBSimulatorVideoStream
     private let state: State
-    private let listener: RecordedTouchEventListener
+    private let listener: RecordedTouchStreamListener
     private let closeCondition = NSCondition()
     private var closeState = CloseState.open
 
@@ -23,26 +23,34 @@ final class RecordingTouchOverlaySession {
         stream: FBSimulatorVideoStream,
         geometry: TouchIndicatorVideoGeometry,
         color: TouchIndicatorColor,
+        framesPerSecond: Int,
         baseDirectory: URL? = nil
     ) throws {
+        precondition(
+            (1...60).contains(framesPerSecond),
+            "VideoRecordingOptions owns the 1...60 FPS invariant."
+        )
         let renderer = try TouchIndicatorRenderer(
             pixelWidth: geometry.pixelWidth,
             pixelHeight: geometry.pixelHeight,
             pixelsPerPoint: geometry.pixelsPerPoint,
             color: color
         )
-        let state = State(renderer: renderer)
+        let state = State(
+            renderer: renderer,
+            framesPerSecond: framesPerSecond
+        )
         stream.updateOverlayBuffer(renderer.pixelBuffer)
 
         do {
-            listener = try RecordedTouchEventListener(
+            listener = try RecordedTouchStreamListener(
                 udid: udid,
                 baseDirectory: baseDirectory,
-                onEvent: { [state] event in
-                    state.enqueue(event)
+                onInput: { [state] input in
+                    state.enqueue(input)
                 },
-                onDiagnostic: { diagnostic in
-                    Self.writeWarning(diagnostic.description)
+                onDiagnostic: { message in
+                    Self.writeWarning(message)
                 }
             )
         } catch {
@@ -126,14 +134,18 @@ private final class State: @unchecked Sendable {
     let firstError = FirstErrorBox()
 
     private let renderer: TouchIndicatorRenderer
+    private let frameIntervalNanoseconds: Int
     private let queue = DispatchQueue(label: "com.lycorp.sim-use.touch-indicator-render")
     private let queueKey = DispatchSpecificKey<UInt8>()
     private var timer: DispatchSourceTimer?
     private var activationUptimeNanoseconds: UInt64?
     private var isClosed = false
 
-    init(renderer: TouchIndicatorRenderer) {
+    init(renderer: TouchIndicatorRenderer, framesPerSecond: Int) {
         self.renderer = renderer
+        self.frameIntervalNanoseconds = Int(
+            1_000_000_000 / UInt64(framesPerSecond)
+        )
         queue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -144,9 +156,9 @@ private final class State: @unchecked Sendable {
         }
     }
 
-    func enqueue(_ event: RecordedTouchEvent) {
+    func enqueue(_ input: RecordedTouchInput) {
         queue.async { [weak self] in
-            self?.consume(event)
+            self?.consume(input)
         }
     }
 
@@ -164,39 +176,38 @@ private final class State: @unchecked Sendable {
         }
     }
 
-    private func consume(_ event: RecordedTouchEvent) {
+    private func consume(_ input: RecordedTouchInput) {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !isClosed else { return }
-        guard let activationUptimeNanoseconds,
-              event.dispatchUptimeNanoseconds >= activationUptimeNanoseconds else { return }
-        apply(event)
-    }
+        guard let activationUptimeNanoseconds else { return }
 
-    private func apply(_ event: RecordedTouchEvent) {
-        dispatchPrecondition(condition: .onQueue(queue))
-
-        var updates: [TouchIndicatorContactUpdate] = []
-        updates.reserveCapacity(event.samples.reduce(0) { $0 + $1.contacts.count })
-        for sample in event.samples {
-            let (uptimeNanoseconds, overflow) = event.dispatchUptimeNanoseconds
-                .addingReportingOverflow(sample.relativeNanoseconds)
-            guard !overflow else {
-                RecordingTouchOverlaySession.writeWarning(
-                    "Discarded touch indicator event \(event.eventID): its monotonic timestamp overflowed."
-                )
-                return
-            }
-            for contact in sample.contacts {
-                updates.append(TouchIndicatorContactUpdate(
-                    contactID: contact.contactID,
-                    phase: Self.phase(contact.phase),
+        switch input {
+        case let .update(publisherID, primitive):
+            guard primitive.dispatchUptimeNanoseconds >= activationUptimeNanoseconds
+            else { return }
+            let phase: TouchIndicatorPhase = primitive.phase == .down
+                ? .began
+                : .ended
+            let updates = primitive.contacts.map { contact in
+                TouchIndicatorContactUpdate(
+                    contactID: TouchIndicatorContactID(
+                        publisherID: publisherID,
+                        localID: contact.localID
+                    ),
+                    phase: phase,
                     position: CGPoint(x: contact.x, y: contact.y),
-                    uptimeNanoseconds: uptimeNanoseconds
-                ))
+                    uptimeNanoseconds: primitive.dispatchUptimeNanoseconds
+                )
             }
-        }
+            renderer.apply(updates)
 
-        renderer.apply(updates)
+        case let .publisherClosed(publisherID, uptimeNanoseconds):
+            guard uptimeNanoseconds >= activationUptimeNanoseconds else { return }
+            renderer.cancelContacts(
+                from: publisherID,
+                uptimeNanoseconds: uptimeNanoseconds
+            )
+        }
         renderAndUpdateTimer()
     }
 
@@ -226,8 +237,8 @@ private final class State: @unchecked Sendable {
         guard timer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(
-            deadline: .now() + .milliseconds(16),
-            repeating: .milliseconds(16),
+            deadline: .now() + .nanoseconds(frameIntervalNanoseconds),
+            repeating: .nanoseconds(frameIntervalNanoseconds),
             leeway: .milliseconds(2)
         )
         timer.setEventHandler { [weak self] in
@@ -257,14 +268,6 @@ private final class State: @unchecked Sendable {
         }
     }
 
-    private static func phase(_ phase: RecordedTouchPhase) -> TouchIndicatorPhase {
-        switch phase {
-        case .began: .began
-        case .moved: .moved
-        case .ended: .ended
-        case .cancelled: .cancelled
-        }
-    }
 }
 
 enum RecordingTouchOverlayError: Error, LocalizedError, Equatable {

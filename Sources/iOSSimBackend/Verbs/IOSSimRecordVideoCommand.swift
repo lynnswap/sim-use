@@ -297,7 +297,8 @@ public struct IOSSimRecordVideoCommand: SimUseExecutableCommand {
                 udid: simulator.udid,
                 stream: recording.stream,
                 geometry: geometry,
-                color: color
+                color: color,
+                framesPerSecond: fps
             )
         } catch {
             throw TouchIndicatorRecordingUnavailableError(

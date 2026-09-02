@@ -5,6 +5,7 @@ import Darwin
 import AVFoundation
 import ImageIO
 import SimUseCore
+@testable import iOSSimBackend
 
 @Suite("Record Video Command Tests", .serialized, .enabled(if: isE2EEnabled))
 struct RecordVideoTests {
@@ -345,7 +346,7 @@ struct RecordVideoTests {
         udid: String,
         outputPath: String
     ) async throws {
-        let socketURL = RecordedTouchTransportPaths(udid: udid).socketURL
+        let socketURL = RecordedTouchStreamPaths(udid: udid).socketURL
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while true {
             let endpointExists = FileManager.default.fileExists(atPath: socketURL.path)
