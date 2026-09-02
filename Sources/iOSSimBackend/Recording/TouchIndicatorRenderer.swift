@@ -3,6 +3,8 @@ import CoreGraphics
 import CoreVideo
 import Dispatch
 import Foundation
+import QuartzCore
+import SimUseVideo
 
 /// A lifecycle update for one touch contact in the renderer's top-left-origin
 /// canvas point space.
@@ -77,13 +79,13 @@ package final class TouchIndicatorRenderer {
     /// this buffer in place instead of allocating a new buffer for each tick.
     package var pixelBuffer: CVPixelBuffer { reusablePixelBuffer }
 
-    /// Whether a queued update or terminal contact still needs the recording
-    /// session's managed render tick. Active contacts redraw only when another
-    /// input update arrives; ended/cancelled contacts keep this true through
-    /// their final clearing render. Query after `render()` to decide whether to
-    /// keep the tick armed.
+    /// Whether a terminal contact still needs the recording session's managed
+    /// render tick. Active contacts redraw only when another input update
+    /// arrives; ended/cancelled contacts keep this true through their final
+    /// clearing render. Query after `render()` to decide whether to keep the
+    /// tick armed.
     package var needsAnimationFrame: Bool {
-        !pendingUpdates.isEmpty || timelines.values.contains { $0.endedAtNanoseconds != nil }
+        timelines.values.contains { $0.endedAtNanoseconds != nil }
     }
 
     private struct ContactTimeline {
@@ -91,11 +93,6 @@ package final class TouchIndicatorRenderer {
         var generationStartedAtNanoseconds: UInt64
         var position: CGPoint
         var endedAtNanoseconds: UInt64?
-    }
-
-    private struct PendingUpdate {
-        let insertionSequence: UInt64
-        let update: TouchIndicatorContactUpdate
     }
 
     private struct Presentation {
@@ -113,6 +110,9 @@ package final class TouchIndicatorRenderer {
         static let fadeNanoseconds: UInt64 = 200_000_000
         static let totalTerminalNanoseconds = holdNanoseconds + fadeNanoseconds
         static let finalScale: CGFloat = 0.85
+        static let terminalTiming = UnitBezierTimingFunction(
+            CAMediaTimingFunction(name: .easeInEaseOut)
+        )
     }
 
     private let color: ResolvedTouchIndicatorColor
@@ -125,8 +125,6 @@ package final class TouchIndicatorRenderer {
     private var activeSequences: [UInt32: UInt64] = [:]
     private var timelines: [UInt64: ContactTimeline] = [:]
     private var nextContactSequence: UInt64 = 0
-    private var pendingUpdates: [PendingUpdate] = []
-    private var nextPendingInsertionSequence: UInt64 = 0
 
     package convenience init(
         pixelWidth: Int,
@@ -194,22 +192,19 @@ package final class TouchIndicatorRenderer {
         try clearPixelBuffer()
     }
 
-    /// Enqueues one ordered group of updates on the host's absolute monotonic
-    /// uptime timeline. `render()` applies only updates whose timestamp is due;
-    /// equal timestamps retain insertion order across calls.
+    /// Applies one ordered group of updates delivered by the recording session.
+    /// Timestamps preserve lifecycle ordering and anchor terminal animation;
+    /// the bridge, rather than the renderer, owns update delivery order.
     package func apply(_ updates: [TouchIndicatorContactUpdate]) {
         for update in updates {
-            pendingUpdates.append(PendingUpdate(
-                insertionSequence: nextPendingInsertionSequence,
-                update: update
-            ))
-            nextPendingInsertionSequence += 1
-        }
-        pendingUpdates.sort {
-            if $0.update.uptimeNanoseconds == $1.update.uptimeNanoseconds {
-                return $0.insertionSequence < $1.insertionSequence
+            switch update.phase {
+            case .began:
+                begin(update)
+            case .moved:
+                move(update)
+            case .ended, .cancelled:
+                end(update)
             }
-            return $0.update.uptimeNanoseconds < $1.update.uptimeNanoseconds
         }
     }
 
@@ -218,7 +213,6 @@ package final class TouchIndicatorRenderer {
     @discardableResult
     package func render() throws -> CVPixelBuffer {
         let uptimeNanoseconds = hostUptimeNanoseconds()
-        applyPendingUpdates(upTo: uptimeNanoseconds)
         let presentations = presentations(at: uptimeNanoseconds)
 
         let lockStatus = CVPixelBufferLockBaseAddress(reusablePixelBuffer, [])
@@ -262,40 +256,16 @@ package final class TouchIndicatorRenderer {
     package func clear() throws {
         activeSequences.removeAll(keepingCapacity: true)
         timelines.removeAll(keepingCapacity: true)
-        pendingUpdates.removeAll(keepingCapacity: true)
         nextContactSequence = 0
-        nextPendingInsertionSequence = 0
         try clearPixelBuffer()
-    }
-
-    private func applyPendingUpdates(upTo uptimeNanoseconds: UInt64) {
-        let dueCount = pendingUpdates.prefix {
-            $0.update.uptimeNanoseconds <= uptimeNanoseconds
-        }.count
-        guard dueCount > 0 else { return }
-
-        for pendingUpdate in pendingUpdates.prefix(dueCount) {
-            let update = pendingUpdate.update
-            switch update.phase {
-            case .began:
-                begin(update)
-            case .moved:
-                move(update)
-            case .ended, .cancelled:
-                end(update)
-            }
-        }
-        pendingUpdates.removeFirst(dueCount)
     }
 
     private func begin(_ update: TouchIndicatorContactUpdate) {
         if let sequence = activeSequences[update.contactID],
            var timeline = timelines[sequence] {
-            // A publisher process may restart between split touch commands and
-            // lose its phase state. The recording session still owns the live
-            // contact ID, so another began for that active ID is movement, not
-            // a second visible timeline. It does start a newer lifecycle epoch:
-            // a delayed terminal update from before this began must not close it.
+            // Repeated began for an active contact is movement by the rendering
+            // contract. It also starts a newer lifecycle epoch so an older
+            // terminal update cannot close the current contact.
             guard update.uptimeNanoseconds >= timeline.generationStartedAtNanoseconds
             else { return }
             timeline.generationStartedAtNanoseconds = update.uptimeNanoseconds
@@ -366,11 +336,12 @@ package final class TouchIndicatorRenderer {
                         / Double(Style.fadeNanoseconds)
                 )
             }
+            let easedProgress = Style.terminalTiming.value(at: fadeProgress)
             presentations.append(Presentation(
                 sequence: timeline.sequence,
                 position: timeline.position,
-                opacity: 1 - fadeProgress,
-                scale: 1 - ((1 - Style.finalScale) * fadeProgress)
+                opacity: 1 - easedProgress,
+                scale: 1 - ((1 - Style.finalScale) * easedProgress)
             ))
         }
 
@@ -421,5 +392,50 @@ package final class TouchIndicatorRenderer {
             throw TouchIndicatorRendererError.drawingContextCreationFailed
         }
         memset(baseAddress, 0, CVPixelBufferGetDataSize(reusablePixelBuffer))
+    }
+}
+
+/// Resolves a Core Animation unit cubic Bezier by inverting its x component.
+/// The control points come from the SDK-provided timing function rather than
+/// duplicating UIKit's curve constants in this renderer.
+private struct UnitBezierTimingFunction: Sendable {
+    private let firstControlPoint: (x: Double, y: Double)
+    private let secondControlPoint: (x: Double, y: Double)
+
+    init(_ timingFunction: CAMediaTimingFunction) {
+        var first = [Float](repeating: 0, count: 2)
+        var second = [Float](repeating: 0, count: 2)
+        timingFunction.getControlPoint(at: 1, values: &first)
+        timingFunction.getControlPoint(at: 2, values: &second)
+        firstControlPoint = (Double(first[0]), Double(first[1]))
+        secondControlPoint = (Double(second[0]), Double(second[1]))
+    }
+
+    func value(at progress: CGFloat) -> CGFloat {
+        let input = Double(progress)
+        var lowerBound = 0.0
+        var upperBound = 1.0
+
+        for _ in 0..<32 {
+            let parameter = (lowerBound + upperBound) / 2
+            if sample(firstControlPoint.x, secondControlPoint.x, at: parameter) < input {
+                lowerBound = parameter
+            } else {
+                upperBound = parameter
+            }
+        }
+
+        return CGFloat(sample(
+            firstControlPoint.y,
+            secondControlPoint.y,
+            at: (lowerBound + upperBound) / 2
+        ))
+    }
+
+    private func sample(_ first: Double, _ second: Double, at parameter: Double) -> Double {
+        let inverse = 1 - parameter
+        return (3 * inverse * inverse * parameter * first)
+            + (3 * inverse * parameter * parameter * second)
+            + (parameter * parameter * parameter)
     }
 }

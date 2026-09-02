@@ -6,8 +6,9 @@ import Foundation
 ///
 /// The stream scales source pixels with `floor`, then rounds each H.264/NV12
 /// dimension up to an even value. Touch coordinates remain logical HID points,
-/// so the renderer scale is the simulator's pixels-per-point multiplied by the
-/// requested video scale.
+/// so the renderer scale is derived from the actual even-rounded encoded width
+/// and the simulator's logical point width. This matches the compositor's
+/// uniform width scale even when rounding changes the requested video scale.
 ///
 /// Do not swap these dimensions or rotate touch points for interface
 /// orientation. The pinned stream applies no rotation, and a live Xcode 27
@@ -43,7 +44,7 @@ struct TouchIndicatorVideoGeometry: Equatable, Sendable {
 
         pixelWidth = Self.evenDimension(screenPixelWidth, scale: videoScale)
         pixelHeight = Self.evenDimension(screenPixelHeight, scale: videoScale)
-        pixelsPerPoint = screenScale * CGFloat(videoScale)
+        pixelsPerPoint = CGFloat(pixelWidth) * screenScale / CGFloat(screenPixelWidth)
     }
 
     private static func evenDimension(_ source: Int, scale: Double) -> Int {

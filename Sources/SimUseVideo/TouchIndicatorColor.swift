@@ -40,7 +40,7 @@ public enum TouchIndicatorColor: String, CaseIterable, ExpressibleByArgument, Se
         }
     }
 
-    func resolveSRGB() throws -> ResolvedTouchIndicatorColor {
+    package func resolveSRGB() throws -> ResolvedTouchIndicatorColor {
         guard let aqua = NSAppearance(named: .aqua) else {
             throw TouchIndicatorColorResolutionError.aquaAppearanceUnavailable
         }
@@ -76,8 +76,8 @@ enum TouchIndicatorColorResolutionError: Error, LocalizedError, Equatable {
     }
 }
 
-struct ResolvedTouchIndicatorColor: Equatable, Sendable {
-    let red: CGFloat
-    let green: CGFloat
-    let blue: CGFloat
+package struct ResolvedTouchIndicatorColor: Equatable, Sendable {
+    package let red: CGFloat
+    package let green: CGFloat
+    package let blue: CGFloat
 }

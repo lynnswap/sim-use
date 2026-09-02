@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import CoreGraphics
 import Testing
 @testable import iOSSimBackend
 
@@ -29,7 +30,7 @@ struct TouchIndicatorVideoGeometryTests {
 
         #expect(geometry.pixelWidth == 590)
         #expect(geometry.pixelHeight == 1278)
-        #expect(geometry.pixelsPerPoint == 1.5)
+        #expect(geometry.pixelsPerPoint == CGFloat(590 * 3) / 1179)
     }
 
     @Test("Invalid screen facts fail instead of inventing an overlay canvas")
